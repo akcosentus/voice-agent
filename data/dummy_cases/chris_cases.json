@@ -1,0 +1,25 @@
+[
+  {
+    "Practice_Name": "Pacific Coast Orthopedics",
+    "NPI": "1234567890",
+    "Tax_ID": "87-6543210",
+    "Billing_Address": "123 Medical Drive, Suite 200, Irvine CA 92618",
+    "Call_Back#": "949-555-0100",
+    "Provider": "Kim, David",
+    "Patient_Name": "Smith, John",
+    "Patient_Birth_Date": "01/15/1985",
+    "Primary_Carrier_Policy#": "XYZ123456789",
+    "Service_Date": "12/10/2025",
+    "Service_Location": "Pacific Coast Surgery Center",
+    "Primary_Carrier_Name": "Blue Cross Blue Shield",
+    "Total_Charge": "2500.00",
+    "Claim#": "CLM2025121001",
+    "Ins_Pmt": "0.00",
+    "Ins_Balance": "2500.00",
+    "CPT_1": "27447",
+    "CPT_2": "27447-59",
+    "CPT_3": "",
+    "CPT_4": "",
+    "Acct#": "PCT-2025-0042"
+  }
+]

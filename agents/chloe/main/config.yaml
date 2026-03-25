@@ -1,0 +1,50 @@
+name: chloe/main
+display_name: "Chloe — General Line"
+description: "Inbound agent for the main reception line"
+type: inbound
+prompt_file: prompt.txt
+
+llm:
+  provider: anthropic
+  model: claude-sonnet-4-6
+  max_tokens: 150
+  temperature: 0.5
+  enable_prompt_caching: true
+
+tts:
+  provider: elevenlabs
+  voice_id: "21m00Tcm4TlvDq8ikWAM"
+  model: eleven_turbo_v2_5
+  settings:
+    stability: 0.7
+    similarity_boost: 0.8
+    style: 0.0
+    use_speaker_boost: false
+    speed: 1.0
+
+stt:
+  provider: deepgram
+
+telephony:
+  phone_number: "+19496913324"
+
+transfer_targets:
+  billing: "+14085559999"
+  scheduling: "+14085556666"
+  medical_records: "+14085555555"
+
+tools:
+  - end_call
+  - transfer_call
+
+first_message: "Thank you for calling Pacific Coast Orthopedics. How may I direct your call?"
+
+recording:
+  enabled: true
+  channels: 2
+
+post_call_analyses: []
+
+case_data:
+  source: json
+  path: "data/dummy_cases/cindy_cases.json"

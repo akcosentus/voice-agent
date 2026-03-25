@@ -1,0 +1,58 @@
+name: chris/claim_status
+display_name: "Chris — Insurance Follow-up"
+description: "Outbound agent that calls payers to check claim status"
+type: outbound
+prompt_file: prompt.txt
+
+llm:
+  provider: anthropic
+  model: claude-sonnet-4-6
+  max_tokens: 200
+  temperature: 0.7
+  enable_prompt_caching: true
+
+tts:
+  provider: elevenlabs
+  voice_id: "pzxut4zZz4GImZNlqQ3H"
+  model: eleven_turbo_v2_5
+  settings:
+    stability: 0.5
+    similarity_boost: 0.8
+    style: 0.0
+    use_speaker_boost: false
+    speed: 1.0
+
+stt:
+  provider: deepgram
+
+interaction:
+  function_call_filler: ""
+  no_filler_functions: ["end_call", "transfer_call"]
+
+telephony:
+  phone_number: "+19496913324"
+
+transfer_targets:
+  billing: "+14085559999"
+  supervisor: "+14085558888"
+
+tools:
+  - end_call
+  - press_digit
+  - transfer_call
+
+first_message: "Hello, I'm just calling to check on a claim."
+
+recording:
+  enabled: true
+  channels: 2
+
+post_call_analyses:
+  - name: call_notes
+    model: claude-haiku-4-5-20251001
+    prompt_file: post_call/call_notes.txt
+    output_type: text
+
+case_data:
+  source: json
+  path: "data/dummy_cases/chris_cases.json"

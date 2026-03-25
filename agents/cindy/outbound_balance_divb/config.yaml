@@ -1,0 +1,8 @@
+extends: cindy/outbound_balance/config.yaml
+
+overrides:
+  display_name: "Cindy — Outbound Balance (Division B)"
+  transfer_targets:
+    billing: "+14085557777"
+  telephony:
+    phone_number: "+19496913324"

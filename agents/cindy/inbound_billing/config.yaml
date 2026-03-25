@@ -1,0 +1,49 @@
+name: cindy/inbound_billing
+display_name: "Cindy — Inbound Billing Support"
+description: "Inbound agent that handles patient billing questions"
+type: inbound
+prompt_file: prompt.txt
+
+llm:
+  provider: anthropic
+  model: claude-sonnet-4-6
+  max_tokens: 150
+  temperature: 0.6
+  enable_prompt_caching: true
+
+tts:
+  provider: elevenlabs
+  voice_id: "EXAVITQu4vr4xnSDxMaL"
+  model: eleven_turbo_v2_5
+  settings:
+    stability: 0.6
+    similarity_boost: 0.75
+    style: 0.0
+    use_speaker_boost: false
+    speed: 1.0
+
+stt:
+  provider: deepgram
+
+telephony:
+  phone_number: "+19496913324"
+
+transfer_targets:
+  billing: "+14085559999"
+  supervisor: "+14085558888"
+
+tools:
+  - end_call
+  - transfer_call
+
+first_message: "Thank you for calling Pacific Coast Orthopedics billing department. How can I help you?"
+
+recording:
+  enabled: true
+  channels: 2
+
+post_call_analyses: []
+
+case_data:
+  source: json
+  path: "data/dummy_cases/cindy_cases.json"
