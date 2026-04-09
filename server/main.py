@@ -399,6 +399,39 @@ async def delete_agent(agent_name: str):
     return {"status": "deleted", "name": agent_name}
 
 
+@app.get("/api/agents/{agent_name:path}/versions")
+async def list_agent_versions(agent_name: str):
+    """Return all version history entries for an agent, newest first."""
+    row = _get_agent_row(agent_name)
+    resp = (
+        get_supabase()
+        .table("agent_versions")
+        .select("*")
+        .eq("agent_id", row["id"])
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return {"agent_name": agent_name, "versions": resp.data or []}
+
+
+@app.get("/api/agents/{agent_name:path}/versions/{version_id}")
+async def get_agent_version(agent_name: str, version_id: str):
+    """Return a specific version entry by its row ID."""
+    row = _get_agent_row(agent_name)
+    resp = (
+        get_supabase()
+        .table("agent_versions")
+        .select("*")
+        .eq("id", version_id)
+        .eq("agent_id", row["id"])
+        .limit(1)
+        .execute()
+    )
+    if not resp.data:
+        raise HTTPException(status_code=404, detail=f"Version {version_id} not found")
+    return resp.data[0]
+
+
 @app.get("/api/agents/{agent_name:path}")
 async def get_agent(agent_name: str):
     """Return full config for a single agent."""
@@ -786,6 +819,46 @@ async def add_voice(payload: VoiceAddRequest):
         .execute()
 
     return {"status": "added", "voice": result.data[0] if result.data else voice_row}
+
+
+@app.post("/api/voices/{voice_id}/refresh")
+async def refresh_voice(voice_id: str):
+    """Re-fetch voice metadata from ElevenLabs and update the local record."""
+    existing = get_supabase().table("voice_library") \
+        .select("voice_id").eq("voice_id", voice_id).limit(1).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail=f"Voice {voice_id} not found in library")
+
+    api_key = os.getenv("ELEVENLABS_API_KEY")
+    import httpx
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"https://api.elevenlabs.io/v1/voices/{voice_id}",
+            headers={"xi-api-key": api_key},
+        )
+
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="Voice no longer exists on ElevenLabs")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"ElevenLabs API error: {resp.status_code}")
+
+    data = resp.json()
+    labels = data.get("labels", {})
+    updates = {
+        "name": data.get("name", "Unknown"),
+        "description": data.get("description", ""),
+        "category": data.get("category", ""),
+        "preview_url": data.get("preview_url", ""),
+        "gender": labels.get("gender", ""),
+        "accent": labels.get("accent", ""),
+        "age": labels.get("age", ""),
+        "use_case": labels.get("use_case", ""),
+    }
+
+    result = get_supabase().table("voice_library") \
+        .update(updates).eq("voice_id", voice_id).execute()
+
+    return {"status": "refreshed", "voice_id": voice_id, "voice": result.data[0] if result.data else updates}
 
 
 @app.delete("/api/voices/{voice_id}")
