@@ -3,11 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import json as _json
 from datetime import datetime
 from typing import Any, Optional
 
 from core.call_result import CallResult
 from core.supabase_client import get_supabase
+
+
+def parse_jsonb(value: Any, default: Any = None) -> Any:
+    """Safely parse a JSONB value that might be a string, None, or already parsed."""
+    if default is None:
+        default = []
+    if value is None:
+        return default
+    if isinstance(value, (list, dict)):
+        return value
+    if isinstance(value, str):
+        try:
+            return _json.loads(value)
+        except (_json.JSONDecodeError, TypeError):
+            return default
+    return default
 
 
 def _dt_iso(dt: Optional[datetime]) -> Optional[str]:
@@ -20,6 +37,7 @@ def _call_row_from_result(result: CallResult) -> dict[str, Any]:
     return {
         "id": result.call_id,
         "agent_name": result.agent_name,
+        "agent_display_name": result.agent_display_name,
         "target_number": result.target_number,
         "direction": result.direction,
         "status": result.status,
@@ -104,7 +122,36 @@ async def get_batch_calls(batch_id: str) -> list[dict[str, Any]]:
     return await asyncio.to_thread(_get_batch_calls_sync, batch_id)
 
 
-def _increment_batch_counter_sync(batch_id: str, field: str) -> None:
+def _get_call_sync(call_id: str) -> Optional[dict[str, Any]]:
+    resp = get_supabase().table("calls").select("*").eq("id", call_id).limit(1).execute()
+    if resp.data and len(resp.data) > 0:
+        return resp.data[0]
+    return None
+
+
+async def get_call(call_id: str) -> Optional[dict[str, Any]]:
+    return await asyncio.to_thread(_get_call_sync, call_id)
+
+
+def _increment_batch_counter_atomic_sync(batch_id: str, field: str) -> None:
+    """Atomic counter increment via Supabase RPC to avoid race conditions."""
+    try:
+        get_supabase().rpc("increment_counter", {
+            "batch_uuid": batch_id,
+            "field_name": field,
+            "amount": 1,
+        }).execute()
+    except Exception as e:
+        from loguru import logger
+        logger.warning(
+            f"RPC increment_counter failed for batch {batch_id}/{field}, "
+            f"using non-atomic fallback: {e}"
+        )
+        _increment_batch_counter_fallback_sync(batch_id, field)
+
+
+def _increment_batch_counter_fallback_sync(batch_id: str, field: str) -> None:
+    """Fallback read-then-write increment if RPC not available."""
     batch = _get_batch_sync(batch_id)
     if not batch:
         return
@@ -113,5 +160,5 @@ def _increment_batch_counter_sync(batch_id: str, field: str) -> None:
 
 
 async def increment_batch_counter(batch_id: str, field: str) -> None:
-    """Increment completed_rows or failed_rows on a batch."""
-    await asyncio.to_thread(_increment_batch_counter_sync, batch_id, field)
+    """Increment completed_rows or failed_rows on a batch (atomic when RPC available)."""
+    await asyncio.to_thread(_increment_batch_counter_atomic_sync, batch_id, field)

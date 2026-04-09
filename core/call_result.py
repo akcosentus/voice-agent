@@ -10,6 +10,7 @@ class CallResult:
     call_id: str
     agent_name: str
     target_number: str
+    agent_display_name: str = ""
     direction: str = "outbound"  # outbound | inbound
     status: str = "pending"  # pending, in_progress, completed, failed, no_answer
     started_at: Optional[datetime] = None

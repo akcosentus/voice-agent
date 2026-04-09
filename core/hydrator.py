@@ -2,7 +2,6 @@
 
 import re
 from datetime import datetime
-from pathlib import Path
 
 VOICE_WRAPPER = (
     "# GLOBAL VOICE SYSTEM INSTRUCTIONS\n"
@@ -16,14 +15,14 @@ VOICE_WRAPPER = (
 )
 
 
-def hydrate_prompt(prompt_path: Path, case_data: dict) -> str:
-    """Read a prompt template and replace all {{Variable_Name}} placeholders.
+def hydrate_prompt(prompt_text: str, case_data: dict) -> str:
+    """Replace all {{Variable_Name}} placeholders in a prompt string.
 
     - If a variable has no value, replace with empty string
     - Always injects {{current_time}} with formatted current datetime
     - Prepends the global voice system instructions wrapper
     """
-    prompt = prompt_path.read_text()
+    prompt = prompt_text
 
     prompt = prompt.replace(
         "{{current_time}}", datetime.now().strftime("%A, %B %d, %Y %I:%M %p")

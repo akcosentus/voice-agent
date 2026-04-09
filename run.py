@@ -1,8 +1,8 @@
 """Entry point — load an agent config and run it over LiveKit transport (for local testing).
 
 Usage:
-    python run.py --agent chris/claim_status --case 0
-    python run.py --agent cindy/outbound_balance --case 0
+    python run.py --agent chris/claim_status
+    python run.py --agent chris/claim_status --cases-file data/dummy_cases/chris_cases.json --case-index 2
 """
 
 import argparse
@@ -21,10 +21,10 @@ from core.config_loader import load_agent_config
 from core.pipeline import build_pipeline, build_pipeline_components
 
 
-async def main(agent_name: str, case_index: int):
+async def main(agent_name: str, cases_file: str, case_index: int):
     config = load_agent_config(agent_name)
 
-    with open(config.case_data.path) as f:
+    with open(cases_file) as f:
         cases = json.load(f)
     case_data = cases[case_index]
 
@@ -56,7 +56,8 @@ async def main(agent_name: str, case_index: int):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run a Cosentus voice agent (LiveKit)")
-    parser.add_argument("--agent", required=True, help="Agent as category/variant (e.g. chris/claim_status)")
-    parser.add_argument("--case", type=int, default=0, help="Case index in the data file")
+    parser.add_argument("--agent", default="chris/claim_status", help="Agent name in Supabase (e.g. chris/claim_status)")
+    parser.add_argument("--cases-file", default="data/dummy_cases/chris_cases.json", help="Path to JSON cases file")
+    parser.add_argument("--case-index", type=int, default=0, help="Case index in the data file")
     args = parser.parse_args()
-    asyncio.run(main(args.agent, args.case))
+    asyncio.run(main(args.agent, args.cases_file, args.case_index))
