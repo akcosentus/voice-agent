@@ -292,3 +292,82 @@ class VoiceAddRequest(BaseModel):
     @classmethod
     def strip_id(cls, v: str) -> str:
         return v.strip()
+
+
+# ── Call list / detail response models ───────────────────────────────────────
+
+
+class CallSummary(BaseModel):
+    id: str
+    agent_name: str
+    agent_display_name: Optional[str] = None
+    target_number: Optional[str] = None
+    direction: Optional[str] = None
+    status: str
+    duration_secs: Optional[float] = None
+    batch_id: Optional[str] = None
+    batch_row_index: Optional[int] = None
+    error: Optional[str] = None
+    created_at: Optional[str] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+
+
+class CallDetail(CallSummary):
+    transcript: Optional[list[dict[str, Any]]] = None
+    post_call_analyses: Optional[dict[str, Any]] = None
+    recording_path: Optional[str] = None
+    case_data: Optional[dict[str, Any]] = None
+
+
+class PaginatedCallsResponse(BaseModel):
+    calls: list[CallSummary]
+    total: int
+    page: int
+    page_size: int
+
+
+class CallAgentEntry(BaseModel):
+    display_name: str
+    agent_name: str
+
+
+class CallAgentNamesResponse(BaseModel):
+    agents: list[CallAgentEntry]
+
+
+# ── Batch list / detail response models ──────────────────────────────────────
+
+
+class BatchSummary(BaseModel):
+    id: str
+    name: Optional[str] = None
+    agent_name: str
+    agent_display_name: Optional[str] = None
+    status: str
+    total_rows: int = 0
+    completed_rows: int = 0
+    failed_rows: int = 0
+    concurrency: int = 1
+    schedule_mode: Optional[str] = None
+    from_number: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class BatchDetailResponse(BaseModel):
+    batch: BatchSummary
+    calls: list[CallSummary]
+
+
+class BatchListResponse(BaseModel):
+    batches: list[BatchSummary]
+
+
+class SignedUrlResponse(BaseModel):
+    url: str
+
+
+class DraftDeleteResponse(BaseModel):
+    status: str
+    batch_id: Optional[str] = None

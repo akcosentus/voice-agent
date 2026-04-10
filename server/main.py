@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from loguru import logger
 from twilio.request_validator import RequestValidator
@@ -44,12 +44,19 @@ from server.batch_parse import build_row_payloads, normalize_phone, parse_upload
 from server.batch_runner import MAX_SERVER_CONCURRENCY, run_batch
 from server.schemas import (
     BatchControlResponse,
+    BatchDetailResponse,
+    BatchListResponse,
+    CallAgentNamesResponse,
+    CallDetail,
     CloneAgentRequest,
     CreateAgentRequest,
     CreatePhoneNumberRequest,
+    DraftDeleteResponse,
     OutboundCallRequest,
     OutboundCallResponse,
+    PaginatedCallsResponse,
     PurchasePhoneNumberRequest,
+    SignedUrlResponse,
     StartBatchRequest,
     StartBatchResponse,
     UpdateAgentRequest,
@@ -920,6 +927,114 @@ async def outbound_call(req: OutboundCallRequest):
     )
 
 
+# ── Call read endpoints ──────────────────────────────────────────────────────
+
+
+@app.get("/api/calls/agents", response_model=CallAgentNamesResponse)
+async def get_call_agent_names():
+    """Unique agent display names from actual call records.
+
+    Includes deleted agents and historical names from before renames,
+    so the filter dropdown always matches what appears in the Agent column.
+    """
+    result = get_supabase().table("calls") \
+        .select("agent_name, agent_display_name").execute()
+
+    seen: dict[str, str] = {}
+    for r in (result.data or []):
+        display = r.get("agent_display_name") or r.get("agent_name") or ""
+        slug = r.get("agent_name") or ""
+        if display and display not in seen:
+            seen[display] = slug
+
+    agents = sorted(
+        [{"display_name": name, "agent_name": slug} for name, slug in seen.items()],
+        key=lambda x: x["display_name"],
+    )
+    return CallAgentNamesResponse(agents=agents)
+
+
+@app.get("/api/calls/{call_id}/recording-url", response_model=SignedUrlResponse)
+async def get_recording_url(call_id: str):
+    """Generate a signed URL for a call's recording."""
+    call = get_supabase().table("calls") \
+        .select("recording_path").eq("id", call_id).limit(1).execute()
+    if not call.data:
+        raise HTTPException(status_code=404, detail=f"Call {call_id} not found")
+
+    path = call.data[0].get("recording_path")
+    if not path:
+        raise HTTPException(status_code=404, detail="No recording for this call")
+
+    try:
+        signed = get_supabase().storage.from_("recordings").create_signed_url(path, 3600)
+        url = (
+            signed.get("signedURL")
+            or signed.get("signedUrl")
+            or (getattr(signed, "signed_url", None))
+        )
+        if not url:
+            raise HTTPException(
+                status_code=500, detail=f"Storage returned no URL for path: {path}"
+            )
+        return SignedUrlResponse(url=str(url))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to create signed URL for recording {path}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate recording URL")
+
+
+@app.get("/api/calls/{call_id}")
+async def get_call_detail(call_id: str):
+    """Return full call record including transcript and analysis."""
+    result = get_supabase().table("calls") \
+        .select("*").eq("id", call_id).limit(1).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail=f"Call {call_id} not found")
+    return result.data[0]
+
+
+@app.get("/api/calls", response_model=PaginatedCallsResponse)
+async def list_calls(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    agent_name: str | None = None,
+    agent_display_name: str | None = None,
+    batch_id: str | None = None,
+    status: str | None = None,
+    sort_by: str = Query(
+        default="created_at",
+        pattern=r"^(created_at|status|duration_secs|agent_name)$",
+    ),
+    sort_order: str = Query(default="desc", pattern=r"^(asc|desc)$"),
+):
+    """Paginated call list with optional filters."""
+    query = get_supabase().table("calls").select("*", count="exact")
+
+    if agent_display_name:
+        query = query.eq("agent_display_name", agent_display_name)
+    elif agent_name:
+        query = query.eq("agent_name", agent_name)
+    if batch_id:
+        query = query.eq("batch_id", batch_id)
+    if status:
+        query = query.eq("status", status)
+
+    query = query.order(sort_by, desc=(sort_order == "desc"))
+
+    offset = (page - 1) * page_size
+    query = query.range(offset, offset + page_size - 1)
+
+    result = query.execute()
+    return PaginatedCallsResponse(
+        calls=result.data or [],
+        total=result.count or 0,
+        page=page,
+        page_size=page_size,
+    )
+
+
 # ── Batch operations ────────────────────────────────────────────────────────
 
 
@@ -1215,6 +1330,77 @@ async def cleanup_draft_batches():
         .execute()
     deleted = len(result.data) if result.data else 0
     return {"status": "cleaned", "deleted": deleted}
+
+
+@app.get("/api/batches", response_model=BatchListResponse)
+async def list_batches():
+    """List all non-draft batches, newest first."""
+    result = get_supabase().table("batches") \
+        .select("*") \
+        .neq("status", "draft") \
+        .neq("status", "ready") \
+        .order("created_at", desc=True) \
+        .execute()
+    return BatchListResponse(batches=result.data or [])
+
+
+@app.get("/api/batches/{batch_id}/download-url", response_model=SignedUrlResponse)
+async def get_batch_download_url(batch_id: str):
+    """Signed URL for the original uploaded file."""
+    batch = await get_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
+
+    path = batch.get("input_file_path")
+    if not path:
+        raise HTTPException(status_code=404, detail="No file associated with this batch")
+
+    try:
+        signed = get_supabase().storage.from_("batch-files").create_signed_url(path, 3600)
+        url = (
+            signed.get("signedURL")
+            or signed.get("signedUrl")
+            or (getattr(signed, "signed_url", None))
+        )
+        if not url:
+            raise HTTPException(
+                status_code=500, detail=f"Storage returned no URL for path: {path}"
+            )
+        return SignedUrlResponse(url=str(url))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to create signed URL for batch file {path}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate download URL")
+
+
+@app.delete("/api/batches/{batch_id}/draft", response_model=DraftDeleteResponse)
+async def delete_draft_batch(batch_id: str):
+    """Delete a draft batch. Atomic — only deletes if status is still 'draft'."""
+    result = get_supabase().table("batches") \
+        .delete() \
+        .eq("id", batch_id) \
+        .eq("status", "draft") \
+        .execute()
+    if not result.data:
+        return DraftDeleteResponse(status="not_found_or_not_draft")
+    return DraftDeleteResponse(status="deleted", batch_id=batch_id)
+
+
+@app.get("/api/batches/{batch_id}", response_model=BatchDetailResponse)
+async def get_batch_detail(batch_id: str):
+    """Full batch record with all associated calls."""
+    batch = await get_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
+
+    calls = get_supabase().table("calls") \
+        .select("*") \
+        .eq("batch_id", batch_id) \
+        .order("batch_row_index", desc=False) \
+        .execute()
+
+    return BatchDetailResponse(batch=batch, calls=calls.data or [])
 
 
 @app.get("/api/batches/{batch_id}/status")
