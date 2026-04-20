@@ -1,0 +1,63 @@
+Subject: [PATCH] validate merged draft state on PUT + POST /agent-drafts
+
+Prevents inconsistent hybrid states (e.g. tts_provider=fish with
+tts_model=eleven_flash_v2_5) from being stored when the client
+submits a partial field update. The client-side fix (atomic
+tts_provider + tts_voice_id + tts_model writes in the agent editor)
+prevents the UI-originating version of this bug, but the Lambda
+should enforce merged-state consistency defensively for any caller
+(scripts, CLI, future clients).
+
+Deployed out-of-band to medcloud-voice-api on 2026-04-20 21:46 UTC.
+See docs/lambda-patches/README.md for smoke-test results.
+---
+ src/index.mjs | 32 ++++++++++++++++++++++++++++----
+ 1 file changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/src/index.mjs b/src/index.mjs
+--- a/src/index.mjs
++++ b/src/index.mjs
+@@ -826,10 +826,26 @@
+           delete body[k];
+         }
+       }
+
+-      const vErrors = validateAgentData(body);
++      // Validate the MERGED state (existing row + incoming fields), not
++      // just the incoming patch. Because this handler is an UPSERT (ON
++      // CONFLICT DO UPDATE), a partial payload like {tts_model: "X"}
++      // would otherwise land on an existing row and leave it in an
++      // impossible state (e.g. previously-set tts_provider="fish" with
++      // an ElevenLabs-only model). The client-side fix writes
++      // tts_provider atomically with voice / model, but the Lambda
++      // should enforce merged-state consistency defensively for any
++      // caller (scripts, CLI, future clients).
++      const existing = body.agent_id
++        ? (await pool.query('SELECT * FROM voice_agent_drafts WHERE agent_id = $1', [body.agent_id])).rows[0]
++        : null;
++      const merged = { ...(existing || {}), ...body };
++      const vErrors = validateAgentData(merged);
+       if (vErrors.length) return respond(400, { error: 'Validation failed', details: vErrors });
+       const newId = uuid();
+       body.id = newId;
+@@ -848,7 +864,19 @@
+       // PUT /api/agent-drafts/:agent_id — update draft
+       if (method === 'PUT' && id) {
+-        const vErrors = validateAgentData(body);
++        // Load the existing row and validate the MERGED state, not just
++        // the incoming patch. A single-field update (e.g.
++        // {tts_model: "X"}) can otherwise leave the draft in an
++        // impossible combination with a previously-set field (e.g.
++        // existing tts_provider="fish" with an ElevenLabs-only model).
++        // The client-side fix (writing tts_provider atomically with
++        // voice / model) prevents the UI from producing these, but the
++        // Lambda should enforce consistency defensively for any caller
++        // (scripts, CLI, future clients).
++        const existing = await pool.query(
++          'SELECT * FROM voice_agent_drafts WHERE agent_id = $1', [id]
++        );
++        const merged = { ...(existing.rows[0] || {}), ...body };
++        const vErrors = validateAgentData(merged);
+         if (vErrors.length) return respond(400, { error: 'Validation failed', details: vErrors });
+         body.updated_at = new Date().toISOString();
+         for (const k of Object.keys(body)) {
