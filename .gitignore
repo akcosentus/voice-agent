@@ -13,3 +13,6 @@ dist/
 build/
 *.bin
 data/calls/
+
+# Editor / IDE state
+.cursor/
