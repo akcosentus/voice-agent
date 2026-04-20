@@ -92,12 +92,15 @@ async def handle_twilio_websocket(
         transport,
         config=config,
         # Twilio audio path:
-        #   audio_out_sample_rate = 8000   → Fish (and any TTS) synthesizes
-        #     directly at 8kHz, exactly what Twilio's μ-law leg needs. No
-        #     resampling between TTS output and the wire. This eliminates
-        #     the chunk-pacing artifacts we saw in the 2026-04-17 17:48 call
-        #     when Fish synthesized at 24kHz and Pipecat resampled to 8kHz
-        #     before μ-law encoding for Twilio.
+        #   audio_out_sample_rate = 8000   → the TTS service synthesizes
+        #     directly at 8kHz, exactly what Twilio's μ-law leg needs.
+        #     No resampling between TTS output and the wire. This
+        #     matters because we saw chunk-pacing artifacts on
+        #     2026-04-17 17:48 when a TTS configured at 24kHz native
+        #     was resampled to 8kHz inside Pipecat before μ-law encoding
+        #     for Twilio — the resampling path produced audible glitches
+        #     on the phone. Synthesizing at 8kHz from the start sidesteps
+        #     that entirely.
         #   audio_in_sample_rate = (default 16000) — DO NOT set to 8000.
         #     Smart Turn v3 model expects 16kHz input (Pipecat #3844).
         #     TwilioFrameSerializer's _input_resampler upsamples Twilio's

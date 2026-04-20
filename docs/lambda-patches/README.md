@@ -20,6 +20,21 @@ directory can be deleted.
 
 ## Applied patches
 
+### 2026-04-20 — remove Fish from TTS provider + model validation lists
+
+**File**: [`2026-04-20-remove-fish-from-tts-validation.patch`](./2026-04-20-remove-fish-from-tts-validation.patch)
+
+**Summary**: Part of the Fish Audio retirement. Removes `'fish'` from
+`VALID_TTS_PROVIDERS` and the `fish:` key from `TTS_MODELS_BY_PROVIDER`.
+Frontend auto-updates from the agent schema endpoint — no frontend
+change needed.
+
+**Deployed**: 2026-04-20 21:55 UTC.
+
+**Post-deploy verification**: `GET /api/agent-schema` returns
+`tts_providers: ['elevenlabs']` and `tts_models_by_provider` with only
+the ElevenLabs key.
+
 ### 2026-04-20 — validate merged draft state on PUT + POST /agent-drafts
 
 **File**: [`2026-04-20-validate-merged-draft-state.patch`](./2026-04-20-validate-merged-draft-state.patch)

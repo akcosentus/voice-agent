@@ -1,0 +1,39 @@
+Subject: [PATCH] remove Fish from TTS provider + model validation lists
+
+Part of the Fish Audio retirement. After chris-claim-status was
+migrated to ElevenLabs (see voice-engine main commit 28d7763 and
+earlier frontend fix 72d9917 in voiceagentfront), no agent in Aurora
+is on Fish and the Python pipeline's Fish branch is being removed in
+the same PR on the voice-engine side.
+
+This patch cleans up the Lambda's validation lists and the agent
+schema returned to the frontend. The frontend auto-updates from the
+schema — no frontend change needed.
+
+Deployed out-of-band to medcloud-voice-api on 2026-04-20 21:55 UTC.
+
+Post-deploy verification (/api/agent-schema):
+  tts_providers:  ['elevenlabs']
+  tts_models_by_provider:
+    {'elevenlabs': ['eleven_turbo_v2_5', 'eleven_flash_v2_5', 'eleven_multilingual_v2']}
+  tts_models (flat): ['eleven_turbo_v2_5', 'eleven_flash_v2_5', 'eleven_multilingual_v2']
+---
+ src/index.mjs | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/src/index.mjs b/src/index.mjs
+--- a/src/index.mjs
++++ b/src/index.mjs
+@@ -399,12 +399,11 @@
+   'claude-sonnet-4-5-20250514',
+ ];
+-const VALID_TTS_PROVIDERS = ['elevenlabs', 'fish'];
++const VALID_TTS_PROVIDERS = ['elevenlabs'];
+ // Per-provider model lists. Keep flat VALID_TTS_MODELS for legacy consumers
+ // that don't know about providers yet.
+ const TTS_MODELS_BY_PROVIDER = {
+   elevenlabs: ['eleven_turbo_v2_5', 'eleven_flash_v2_5', 'eleven_multilingual_v2'],
+-  fish: ['s1', 's2', 's2-mini', 's2-pro'],
+ };
+ const VALID_TTS_MODELS = Object.values(TTS_MODELS_BY_PROVIDER).flat();
+ const VALID_STT_PROVIDERS = ['deepgram', 'elevenlabs'];
