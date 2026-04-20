@@ -1,5 +1,6 @@
-"""Agent config loader — reads from Supabase agents table with in-memory cache."""
+"""Agent config loader — reads from Lambda API with in-memory cache."""
 
+import asyncio
 import time
 from typing import Any, Optional
 
@@ -33,7 +34,7 @@ class TTSConfig(BaseModel):
 
 
 class STTConfig(BaseModel):
-    provider: str = "deepgram"
+    provider: str = "elevenlabs"
     language: str = "en"
     keywords: list[str] = Field(default_factory=list)
 
@@ -68,6 +69,12 @@ class AgentConfig(BaseModel):
     description: str = ""
     system_prompt: str = ""
     first_message: str = ""
+    # IVR navigation goal. When set, the pipeline wraps the LLM in an
+    # IVRNavigator that classifies each call's opening audio as IVR vs
+    # human, navigates any menu tree autonomously, then hands off to the
+    # system_prompt for human conversation. When empty/None, the pipeline
+    # runs a standard LLM-only flow (no navigator, no classifier call).
+    ivr_goal: str = ""
     llm: LLMConfig = Field(default_factory=LLMConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
     stt: STTConfig = Field(default_factory=STTConfig)
@@ -104,6 +111,7 @@ def row_to_config(row: dict[str, Any]) -> AgentConfig:
         description=row.get("description", ""),
         system_prompt=row.get("system_prompt", ""),
         first_message=row.get("first_message", ""),
+        ivr_goal=row.get("ivr_goal") or "",
         llm=LLMConfig(
             provider=row.get("llm_provider", "anthropic"),
             model=row.get("llm_model", "claude-sonnet-4-6"),
@@ -124,7 +132,7 @@ def row_to_config(row: dict[str, Any]) -> AgentConfig:
             ),
         ),
         stt=STTConfig(
-            provider=row.get("stt_provider", "deepgram"),
+            provider=row.get("stt_provider") or "elevenlabs",
             language=row.get("stt_language", "en"),
             keywords=list(row.get("stt_keywords") or []),
         ),
@@ -155,46 +163,54 @@ def invalidate_cache(agent_name: str | None = None):
 
 
 def load_agent_config(agent_name: str) -> AgentConfig:
-    """Load agent config from Supabase (cached for 60s)."""
+    """Load agent config from Lambda (cached for 60s).
+
+    Uses asyncio.run() when called from sync context (e.g. batch runner
+    pre-validation).  The Lambda client handles float casting internally.
+    """
     now = time.monotonic()
     cached = _cache.get(agent_name)
     if cached and (now - cached[0]) < _CACHE_TTL:
         return cached[1]
 
-    from core.supabase_client import get_supabase
+    from core.lambda_client import get_agent_config
 
-    resp = (
-        get_supabase()
-        .table("agents")
-        .select("*")
-        .eq("name", agent_name)
-        .eq("is_active", True)
-        .limit(1)
-        .execute()
-    )
-    if not resp.data:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            row = pool.submit(asyncio.run, get_agent_config(agent_name)).result()
+    else:
+        row = asyncio.run(get_agent_config(agent_name))
+
+    if not row:
         raise ValueError(f"Agent not found: {agent_name}")
 
-    config = row_to_config(resp.data[0])
+    config = row_to_config(row)
     _cache[agent_name] = (now, config)
     return config
 
 
 def load_agent_draft(agent_name: str) -> AgentConfig:
-    """Load agent config from the agent_drafts table (unpublished working copy).
+    """Load unpublished draft config for test calls."""
+    from core.lambda_client import get_agent_draft
 
-    Used by test calls to preview draft configs before publishing.
-    """
-    from core.supabase_client import get_supabase
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
 
-    resp = (
-        get_supabase()
-        .table("agent_drafts")
-        .select("*")
-        .eq("name", agent_name)
-        .limit(1)
-        .execute()
-    )
-    if not resp.data:
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            row = pool.submit(asyncio.run, get_agent_draft(agent_name)).result()
+    else:
+        row = asyncio.run(get_agent_draft(agent_name))
+
+    if not row:
         raise ValueError(f"No draft found for agent: {agent_name}")
-    return row_to_config(resp.data[0])
+    return row_to_config(row)

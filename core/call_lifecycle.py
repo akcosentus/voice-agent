@@ -23,43 +23,21 @@ from core.config_loader import AgentConfig
 from core.pipeline import PipelineBundle
 from core.post_call import run_post_call_analyses
 
-
-def supabase_configured() -> bool:
-    return bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_KEY"))
-
-
-async def safe_save_call(result: CallResult, *, is_final: bool = False) -> None:
-    if not supabase_configured():
-        logger.warning("Supabase not configured; skipping call persistence")
-        return
-    try:
-        await save_call_result(result)
-    except Exception as e:
-        if is_final:
-            logger.error(
-                f"FINAL save failed for call {result.call_id}, retrying once: {e}"
-            )
-            try:
-                await asyncio.sleep(1)
-                await save_call_result(result)
-            except Exception as e2:
-                logger.critical(
-                    f"FINAL save LOST for call {result.call_id}: {e2}"
-                )
-        else:
-            logger.exception("Failed to save call result to Supabase")
+S3_BUCKET = os.getenv("S3_BUCKET", "medcloud-voice-us-prod-825")
+AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
 
 
-async def upload_recording_wav(
+async def _upload_recording_s3(
     call_key: str,
     audio: bytes,
     sample_rate: int,
     num_channels: int,
 ) -> str | None:
-    if not supabase_configured() or not audio:
+    """Encode raw audio as WAV and upload to S3. Returns the S3 key or None."""
+    if not audio:
         return None
     try:
-        from core.supabase_client import get_supabase
+        import boto3
 
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
@@ -68,16 +46,45 @@ async def upload_recording_wav(
             wf.setframerate(sample_rate)
             wf.writeframes(audio)
         data = buf.getvalue()
-        path = f"recordings/{call_key}.wav"
-        get_supabase().storage.from_("recordings").upload(
-            path,
-            data,
-            file_options={"content-type": "audio/wav", "upsert": "true"},
+
+        key = f"recordings/{call_key}.wav"
+        s3 = boto3.client("s3", region_name=AWS_REGION)
+        await asyncio.to_thread(
+            s3.put_object,
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=data,
+            ContentType="audio/wav",
         )
-        return path
+        return key
     except Exception:
-        logger.exception("Failed to upload recording to Supabase Storage")
+        logger.exception("Failed to upload recording to S3")
         return None
+
+
+async def _safe_save_call(result: CallResult, *, is_final: bool = False) -> None:
+    """Persist call record with retry on final save."""
+    try:
+        await save_call_result(result)
+    except Exception as e:
+        if is_final:
+            logger.error(
+                "FINAL save failed for call %s, retrying once: %s",
+                result.call_id, e,
+            )
+            try:
+                await asyncio.sleep(1)
+                await save_call_result(result)
+            except Exception as e2:
+                logger.critical(
+                    "FINAL save LOST for call %s: %s", result.call_id, e2,
+                )
+        else:
+            logger.exception("Failed to save call result")
+
+
+# Re-export for callers that import from here
+safe_save_call = _safe_save_call
 
 
 async def run_call(
@@ -92,7 +99,7 @@ async def run_call(
     This is the single code path for ALL calls (Twilio, WebRTC, any future
     transport).  It wires recording capture, transport events, runs the
     pipeline, captures the transcript, uploads the recording, runs post-call
-    analysis, and persists everything to Supabase.
+    analysis, and persists everything to the Lambda data layer.
 
     The caller is responsible for:
       - building the transport
@@ -106,12 +113,17 @@ async def run_call(
 
         @bundle.audiobuffer.event_handler("on_audio_data")
         async def on_audio_data(_proc, audio, sample_rate, num_channels):
+            # Recording is best-effort — never let upload failures kill the call.
             nonlocal recording_uploaded
             if recording_uploaded or not audio:
                 return
-            path = await upload_recording_wav(
-                result.call_id, audio, sample_rate, num_channels
-            )
+            try:
+                path = await _upload_recording_s3(
+                    result.call_id, audio, sample_rate, num_channels
+                )
+            except Exception:
+                logger.exception("Recording handler crashed — continuing call")
+                path = None
             if path:
                 result.recording_path = path
                 recording_uploaded = True
@@ -151,7 +163,7 @@ async def run_call(
                 result.ended_at - result.started_at
             ).total_seconds()
         result.transcript = list(bundle.transcript_log)
-        await safe_save_call(result, is_final=True)
+        await _safe_save_call(result, is_final=True)
 
         if result.status == "completed" and config.post_call_analyses:
             try:
@@ -163,4 +175,20 @@ async def run_call(
                 result.post_call_analyses = {
                     "_error": f"Analysis failed: {str(e)[:200]}"
                 }
-            await safe_save_call(result, is_final=True)
+            await _safe_save_call(result, is_final=True)
+
+        # Tell the queue consumer the batch row is terminal so it can release
+        # its concurrency slot and (if all rows done) finalize the batch.
+        if result.batch_row_id:
+            try:
+                from core.lambda_client import invoke as _lambda_invoke
+                await _lambda_invoke(
+                    "PUT",
+                    f"/batch-rows/{result.batch_row_id}",
+                    body={"status": result.status, "call_id": result.call_id},
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to write terminal status to batch row %s",
+                    result.batch_row_id,
+                )

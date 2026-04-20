@@ -1,16 +1,32 @@
-"""FastAPI server — Twilio WebSocket + WebRTC telephony for Cosentus voice agents."""
+"""FastAPI calling engine + Lambda proxy.
+
+This server does two things:
+1. Real-time voice calls: Twilio WebSocket, WebRTC test calls, outbound dialing
+2. Lambda proxy: forwards frontend data requests to the MedCloud Lambda API
+   (the frontend can't call Lambda directly due to API Gateway auth)
+"""
 
 import asyncio
+import json as _json
 import os
-import re
 import uuid
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    WebSocket,
+)
+from fastapi.responses import HTMLResponse
 from loguru import logger
 from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import Connect, Stream, VoiceResponse
@@ -20,892 +36,904 @@ from pipecat.transports.smallwebrtc.request_handler import (
     SmallWebRTCRequestHandler,
     SmallWebRTCPatchRequest,
     IceCandidate,
+    IceServer,
 )
 
-from core.call_store import get_batch, insert_batch, update_batch
-from core.config_loader import invalidate_cache, load_agent_config
-from core.supabase_client import get_supabase
-from core.validation import (
-    ALLOWED_LLM_MODELS,
-    ALLOWED_STT_LANGUAGES,
-    ALLOWED_STT_PROVIDERS,
-    ALLOWED_TOOL_TYPES,
-    ALLOWED_TTS_MODELS,
-    ALLOWED_TTS_PROVIDERS,
-    ALLOWED_VOICEMAIL_ACTIONS,
-    E164_RE,
-    FIELD_LABELS,
-    FIELD_RANGES,
-    NEW_AGENT_DEFAULTS,
-    TOOL_SETTINGS_SCHEMA,
-    validate_agent_data,
+from core.config_loader import load_agent_config
+from core.lambda_client import (
+    get_agent_config,
+    get_agent_draft,
+    get_agent_schema,
+    get_batch,
+    get_call_template,
+    get_claim_context,
+    get_payer,
+    invoke,
+    list_call_templates,
+    list_payers,
+    list_phone_numbers,
 )
-from server.batch_parse import build_row_payloads, normalize_phone, parse_upload_file
-from server.batch_runner import MAX_SERVER_CONCURRENCY, run_batch
-from server.schemas import (
-    BatchControlResponse,
-    BatchDetailResponse,
-    BatchListResponse,
-    CallAgentNamesResponse,
-    CallDetail,
-    CloneAgentRequest,
-    CreateAgentRequest,
-    CreatePhoneNumberRequest,
-    DraftDeleteResponse,
-    OutboundCallRequest,
-    OutboundCallResponse,
-    PaginatedCallsResponse,
-    PurchasePhoneNumberRequest,
-    SignedUrlResponse,
-    StartBatchRequest,
-    StartBatchResponse,
-    UpdateAgentRequest,
-    UpdateBatchRowsRequest,
-    UpdateBatchRowsResponse,
-    UpdatePhoneNumberRequest,
-    UpdatePromptRequest,
-    UploadBatchResponse,
-    UploadRowResponse,
-    VoiceAddRequest,
-    VoiceLookupRequest,
+from server.batch_queue import (
+    cancel_batch as _cancel_batch,
+    pause_batch as _pause_batch,
+    resume_batch as _resume_batch,
+    start_batch as _start_batch,
 )
+from server.schemas import OutboundCallRequest, OutboundCallResponse
 from server.twilio_outbound import place_outbound_call, ws_url_from_env
 from server.ws_handler import handle_twilio_websocket
 
-app = FastAPI(title="Cosentus Voice Agent Server")
+app = FastAPI(title="MedCloud Voice Engine")
 
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
+_API_KEY = os.getenv("COSENTUS_API_KEY", "")
+_AUTH_EXEMPT = frozenset({
+    "/health",
+    "/twilio/incoming",
+    "/api/twilio/status-callback",
+    "/ws",
+    "/api/test-call/connect",
+})
+
+
+class APIKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        if not _API_KEY:
+            return await call_next(request)
+        path = request.url.path
+        if path in _AUTH_EXEMPT or path.startswith("/ws") or request.method == "OPTIONS":
+            return await call_next(request)
+        key = request.headers.get("x-api-key", "")
+        if key != _API_KEY:
+            return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
+        return await call_next(request)
+
+
+app.add_middleware(APIKeyMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "https://voice-agents-front-zeta.vercel.app",
-        "https://unprofessed-unephemeral-dwana.ngrok-free.dev",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 _pending_calls: dict[str, dict] = {}
-_webrtc_handler = SmallWebRTCRequestHandler()
+_webrtc_handler = SmallWebRTCRequestHandler(
+    ice_servers=[IceServer(urls="stun:stun.l.google.com:19302")],
+)
+
+S3_BUCKET = os.getenv("S3_BUCKET", "medcloud-voice-us-prod-825")
+AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+
+# ── Background services (consumer + CloudWatch heartbeat) ───────────────────
+
+from server.call_queue_consumer import UnifiedCallConsumer
+
+_queue_consumer = UnifiedCallConsumer(_pending_calls)
+_cloudwatch = None
+
+
+async def _health_heartbeat() -> None:
+    """Push a 1-per-minute HealthCheck metric to CloudWatch."""
+    global _cloudwatch
+    try:
+        import boto3
+        _cloudwatch = boto3.client("cloudwatch", region_name=AWS_REGION)
+    except Exception:
+        logger.warning("CloudWatch client init failed — heartbeat disabled")
+        return
+    while True:
+        try:
+            await asyncio.to_thread(
+                _cloudwatch.put_metric_data,
+                Namespace="VoiceEngine",
+                MetricData=[{"MetricName": "HealthCheck", "Value": 1, "Unit": "Count"}],
+            )
+        except Exception as exc:
+            logger.warning(f"Health heartbeat push failed: {exc}")
+        await asyncio.sleep(60)
 
 
 @app.on_event("startup")
-async def _recover_orphaned_batches():
-    """Resume batches that were running/scheduled when the server last stopped."""
+async def _on_startup() -> None:
+    asyncio.create_task(_queue_consumer.start())
+    asyncio.create_task(_health_heartbeat())
+    logger.info("Background services started: queue consumer + CloudWatch heartbeat")
+
+
+@app.on_event("shutdown")
+async def _on_shutdown() -> None:
+    _queue_consumer.stop()
+
+
+def _is_uuid(val: str) -> bool:
     try:
-        result = (
-            get_supabase()
-            .table("batches")
-            .select("id")
-            .in_("status", ["running", "scheduled"])
-            .execute()
+        uuid.UUID(val)
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+
+async def validate_agent_ready(agent_name: str) -> list[str]:
+    """Check agent config is complete enough to make a call."""
+    errors: list[str] = []
+    try:
+        config = load_agent_config(agent_name)
+    except Exception as e:
+        return [f"Failed to load agent config: {e}"]
+    if not config:
+        return [f"Agent '{agent_name}' not found"]
+    if not config.system_prompt or len(config.system_prompt.strip()) < 10:
+        errors.append("Agent has no system prompt (or it's too short)")
+    if not config.tts.voice_id:
+        errors.append("Agent has no TTS voice configured")
+    if not config.llm.model:
+        errors.append("Agent has no LLM model configured")
+    if not config.tts.model:
+        errors.append("Agent has no TTS model configured")
+    return errors
+
+
+# ── Lambda proxy helper ─────────────────────────────────────────────────────
+
+
+async def _proxy(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    query: dict | None = None,
+):
+    """Forward a request to the Lambda and return the result.
+
+    Converts Lambda _error responses into proper HTTPExceptions.
+    """
+    result = await invoke(method, path, body=body, query=query)
+    if isinstance(result, dict) and result.get("_error"):
+        raise HTTPException(
+            status_code=result.get("_status", 502),
+            detail=result.get("_detail", "Lambda request failed"),
         )
-        for b in result.data or []:
-            bid = b["id"]
-            logger.info(f"Recovering orphaned batch: {bid}")
-            asyncio.create_task(run_batch(_pending_calls, bid))
-    except Exception:
-        logger.exception("Failed to recover orphaned batches on startup")
+    return result
 
 
+def _s3_client():
+    import boto3
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+    return boto3.client("s3", region_name=AWS_REGION)
 
 
-
-def _storage_upload_batch_file(path: str, data: bytes, content_type: str) -> None:
-    get_supabase().storage.from_("batch-files").upload(
-        path,
-        data,
-        file_options={"content-type": content_type, "upsert": "true"},
+async def _s3_presigned_url(key: str, expires_in: int = 3600) -> str:
+    s3 = _s3_client()
+    return await asyncio.to_thread(
+        s3.generate_presigned_url,
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=expires_in,
     )
 
 
-def _storage_download(path: str) -> bytes:
-    return get_supabase().storage.from_("batch-files").download(path)
+# ── Health check ─────────────────────────────────────────────────────────────
 
 
-def _get_agent_row(agent_name: str) -> dict:
-    resp = (
-        get_supabase()
-        .table("agents")
-        .select("*")
-        .eq("name", agent_name)
-        .eq("is_active", True)
-        .limit(1)
-        .execute()
-    )
-    if not resp.data:
-        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_name}")
-    return resp.data[0]
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "voice-engine"}
 
 
-def _agent_detail_from_row(row: dict) -> dict:
-    prompt = row.get("system_prompt", "")
-    variables = sorted(set(re.findall(r"\{\{(\w+)\}\}", prompt)))
-    pca = row.get("post_call_analyses") or {"model": "claude-haiku-4-5-20251001", "fields": []}
-    tools = row.get("tools") or []
+@app.get("/api/system/status")
+async def system_status():
+    """Consumer + concurrency status for monitoring."""
     return {
-        "id": row["id"],
-        "name": row["name"],
-        "display_name": row.get("display_name", ""),
-        "description": row.get("description", ""),
-        "llm": {
-            "provider": row.get("llm_provider", "anthropic"),
-            "model": row.get("llm_model", "claude-sonnet-4-6"),
-            "temperature": row.get("temperature", 0.7),
-            "max_tokens": row.get("max_tokens", 200),
-            "enable_prompt_caching": row.get("enable_prompt_caching", True),
-        },
-        "tts": {
-            "provider": row.get("tts_provider", "elevenlabs"),
-            "voice_id": row.get("tts_voice_id", ""),
-            "model": row.get("tts_model", "eleven_turbo_v2_5"),
-            "settings": {
-                "stability": row.get("tts_stability"),
-                "similarity_boost": row.get("tts_similarity_boost"),
-                "style": row.get("tts_style"),
-                "use_speaker_boost": row.get("tts_use_speaker_boost"),
-                "speed": row.get("tts_speed"),
-            },
-        },
-        "stt": {
-            "provider": row.get("stt_provider", "deepgram"),
-            "language": row.get("stt_language", "en"),
-            "keywords": list(row.get("stt_keywords") or []),
-        },
-        "tools": tools,
-        "first_message": row.get("first_message", ""),
-        "prompt_variables": variables,
-        "prompt_preview": prompt[:500] + ("..." if len(prompt) > 500 else ""),
-        "recording": {
-            "enabled": row.get("recording_enabled", True),
-            "channels": row.get("recording_channels", 2),
-        },
-        "post_call_analyses": pca,
-        "idle_timeout_secs": row.get("idle_timeout_secs", 30),
-        "idle_message": row.get("idle_message", ""),
-        "max_call_duration_secs": row.get("max_call_duration_secs", 1800),
-        "voicemail_action": row.get("voicemail_action", "hangup"),
-        "voicemail_message": row.get("voicemail_message", ""),
-        "max_retries": row.get("max_retries", 0),
-        "retry_delay_secs": row.get("retry_delay_secs", 300),
-        "default_concurrency": row.get("default_concurrency", 1),
-        "calling_window_start": row.get("calling_window_start"),
-        "calling_window_end": row.get("calling_window_end"),
-        "calling_window_days": row.get("calling_window_days"),
-        "created_at": row.get("created_at"),
-        "updated_at": row.get("updated_at"),
+        "consumer": _queue_consumer.status,
+        "health": "ok",
     }
 
 
-def _record_agent_version(agent_id: str, change_type: str, old_val: dict, new_val: dict):
-    try:
-        get_supabase().table("agent_versions").insert({
-            "agent_id": agent_id,
-            "change_type": change_type,
-            "previous_value": old_val,
-            "new_value": new_val,
-        }).execute()
-    except Exception:
-        logger.exception("Failed to record agent version")
-
-
-# ── Agent schema endpoint ───────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# PROXY: Agent endpoints → Lambda
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 @app.get("/api/agent-schema")
-async def get_agent_schema():
-    """Return allowed values and defaults for frontend form rendering."""
-    return {
-        "llm_models": ALLOWED_LLM_MODELS,
-        "tts_providers": ALLOWED_TTS_PROVIDERS,
-        "tts_models": ALLOWED_TTS_MODELS,
-        "stt_providers": ALLOWED_STT_PROVIDERS,
-        "stt_languages": ALLOWED_STT_LANGUAGES,
-        "tool_types": ALLOWED_TOOL_TYPES,
-        "tool_settings_schema": TOOL_SETTINGS_SCHEMA,
-        "voicemail_actions": ALLOWED_VOICEMAIL_ACTIONS,
-        "field_ranges": FIELD_RANGES,
-        "defaults": NEW_AGENT_DEFAULTS,
-        "field_labels": FIELD_LABELS,
-        "post_call_field_types": ["text", "selector"],
-        "post_call_default": {
-            "model": "claude-haiku-4-5-20251001",
-            "fields": [],
-        },
-    }
-
-
-# ── Agent CRUD ──────────────────────────────────────────────────────────────
+async def proxy_agent_schema():
+    return await get_agent_schema() or {}
 
 
 @app.get("/api/agents")
-async def list_agents():
-    """List available agents from Supabase."""
-    resp = (
-        get_supabase()
-        .table("agents")
-        .select("id, name, display_name, description, llm_model, tts_model, tts_voice_id")
-        .eq("is_active", True)
-        .order("name")
-        .execute()
-    )
-    return {"agents": resp.data or []}
+async def proxy_list_agents():
+    return await _proxy("GET", "/agents")
 
 
 @app.post("/api/agents")
-async def create_agent(payload: CreateAgentRequest):
-    """Create a new agent with defaults filled in."""
-    cleaned, errors = validate_agent_data(
-        {"name": payload.name, "display_name": payload.display_name or payload.name},
-        is_create=True,
-    )
-    if errors:
-        raise HTTPException(status_code=400, detail={"errors": errors})
+async def proxy_create_agent(request: Request):
+    body = await request.json()
+    result = await _proxy("POST", "/agents", body=body)
+    agent_name = result.get("name") if isinstance(result, dict) else None
+    if agent_name:
+        try:
+            await _proxy("POST", "/agent-drafts", body={
+                "agent_id": agent_name,
+                "name": agent_name,
+                **{k: v for k, v in result.items() if k not in ("id", "created_at", "updated_at")},
+                "has_unpublished_changes": False,
+            })
+        except Exception:
+            logger.warning("Auto-draft creation failed for %s", agent_name)
+    return result
 
-    existing = (
-        get_supabase()
-        .table("agents")
-        .select("id")
-        .eq("name", cleaned["name"])
-        .limit(1)
-        .execute()
-    )
-    if existing.data:
-        raise HTTPException(status_code=409, detail=f"Agent '{cleaned['name']}' already exists")
 
-    resp = get_supabase().table("agents").insert(cleaned).execute()
-    if not resp.data:
-        raise HTTPException(status_code=500, detail="Failed to create agent")
-    new_row = resp.data[0]
-
-    skip_drafts = {"id", "created_at", "updated_at", "created_by", "extends_agent_id",
-                   "overrides", "is_active"}
-    draft_data = {k: v for k, v in new_row.items() if k not in skip_drafts}
-    draft_data["agent_id"] = new_row["id"]
-    draft_data["has_unpublished_changes"] = False
+@app.get("/api/agents/{agent_name:path}/draft")
+async def proxy_get_agent_draft(agent_name: str):
+    result = await get_agent_draft(agent_name)
+    if result:
+        return result
+    live = await invoke("GET", f"/agents/{agent_name}")
+    if not live or (isinstance(live, dict) and live.get("_error")):
+        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_name}")
     try:
-        get_supabase().table("agent_drafts").upsert(
-            draft_data, on_conflict="agent_id"
-        ).execute()
+        draft_body = {
+            "agent_id": agent_name,
+            "name": agent_name,
+            **{k: v for k, v in live.items() if k not in ("id", "created_at", "updated_at")},
+            "has_unpublished_changes": False,
+        }
+        created = await _proxy("POST", "/agent-drafts", body=draft_body)
+        return created if created else draft_body
     except Exception:
-        logger.warning(f"Draft creation failed for {cleaned.get('name')}, editor will handle it")
+        logger.warning("Auto-draft creation on read failed for %s", agent_name)
+        return {**live, "agent_id": agent_name, "has_unpublished_changes": False}
 
-    return _agent_detail_from_row(new_row)
+
+@app.put("/api/agents/{agent_name:path}/draft")
+async def proxy_update_agent_draft(agent_name: str, request: Request):
+    body = await request.json()
+    body.setdefault("agent_id", agent_name)
+    body.setdefault("name", agent_name)
+    return await _proxy("POST", "/agent-drafts", body=body)
+
+
+@app.post("/api/agents/{agent_name:path}/publish")
+async def proxy_publish_agent(agent_name: str):
+    return await _proxy("POST", f"/agent-versions", body={"agent_name": agent_name})
 
 
 @app.get("/api/agents/{agent_name:path}/prompt")
-async def get_agent_prompt(agent_name: str):
-    """Return the full system prompt text for an agent."""
-    row = _get_agent_row(agent_name)
-    content = row.get("system_prompt", "")
+async def proxy_get_agent_prompt(agent_name: str):
+    result = await get_agent_config(agent_name)
+    if not result:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_name}")
+    import re
+
+    content = result.get("system_prompt", "")
     variables = sorted(set(re.findall(r"\{\{(\w+)\}\}", content)))
     return {"content": content, "prompt_variables": variables}
 
 
 @app.put("/api/agents/{agent_name:path}/prompt")
-async def update_agent_prompt(agent_name: str, payload: UpdatePromptRequest):
-    """Update the agent's system prompt in Supabase."""
-    row = _get_agent_row(agent_name)
-    content = payload.content
-    old_prompt = row.get("system_prompt", "")
-    get_supabase().table("agents").update({"system_prompt": content}).eq("id", row["id"]).execute()
-    invalidate_cache(agent_name)
-    _record_agent_version(row["id"], "prompt", {"system_prompt": old_prompt}, {"system_prompt": content})
-
-    variables = sorted(set(re.findall(r"\{\{(\w+)\}\}", content)))
-    return {
-        "prompt_variables": variables,
-        "prompt_preview": content[:500] + ("..." if len(content) > 500 else ""),
-    }
+async def proxy_update_agent_prompt(agent_name: str, request: Request):
+    body = await request.json()
+    return await _proxy("PUT", f"/agents/{agent_name}", body={"system_prompt": body.get("content", "")})
 
 
 @app.post("/api/agents/{agent_name:path}/clone")
-async def clone_agent(agent_name: str, payload: CloneAgentRequest):
-    """Clone an existing agent with a new name and a matching draft row."""
-    row = _get_agent_row(agent_name)
-
-    source_name = row["name"]
-    source_display = row.get("display_name", source_name)
-    new_name = payload.name or f"{source_name}_clone"
-    new_display = payload.display_name or f"{source_display} (Clone)"
-
-    existing = get_supabase().table("agents").select("id").eq("name", new_name).limit(1).execute()
-    if existing.data:
-        raise HTTPException(status_code=409, detail=f"Agent '{new_name}' already exists")
-
-    skip_agents = {"id", "created_at", "updated_at", "created_by", "extends_agent_id", "overrides"}
-    clone_data = {k: v for k, v in row.items() if k not in skip_agents}
-    clone_data["name"] = new_name
-    clone_data["display_name"] = new_display
-    clone_data["is_active"] = True
-
-    resp = get_supabase().table("agents").insert(clone_data).execute()
-    if not resp.data:
-        raise HTTPException(status_code=500, detail="Failed to clone agent")
-    new_row = resp.data[0]
-
-    skip_drafts = {"id", "created_at", "updated_at", "created_by", "extends_agent_id",
-                   "overrides", "is_active"}
-    draft_data = {k: v for k, v in new_row.items() if k not in skip_drafts}
-    draft_data["agent_id"] = new_row["id"]
-    draft_data["has_unpublished_changes"] = False
-    try:
-        get_supabase().table("agent_drafts").insert(draft_data).execute()
-    except Exception:
-        logger.exception("Failed to create draft for cloned agent")
-
-    invalidate_cache(new_name)
-    return _agent_detail_from_row(new_row)
+async def proxy_clone_agent(agent_name: str, request: Request):
+    body = await request.json()
+    result = await _proxy("POST", f"/agents/{agent_name}/clone", body=body)
+    clone_name = result.get("name") if isinstance(result, dict) else None
+    if clone_name:
+        try:
+            await _proxy("POST", "/agent-drafts", body={
+                "agent_id": clone_name,
+                "name": clone_name,
+                **{k: v for k, v in result.items() if k not in ("id", "created_at", "updated_at")},
+                "has_unpublished_changes": False,
+            })
+        except Exception:
+            logger.warning("Auto-draft creation failed for clone %s", clone_name)
+    return result
 
 
-@app.put("/api/agents/{agent_name:path}")
-async def update_agent(agent_name: str, payload: UpdateAgentRequest):
-    """Partial update of an agent's config in Supabase."""
-    row = _get_agent_row(agent_name)
-    body = payload.model_dump(exclude_none=True)
-
-    cleaned, errors = validate_agent_data(body, is_create=False)
-    if errors:
-        raise HTTPException(status_code=400, detail={"errors": errors})
-
-    if not cleaned:
-        return _agent_detail_from_row(row)
-
-    snapshot_before = {k: row.get(k) for k in cleaned}
-    try:
-        get_supabase().table("agents").update(cleaned).eq("id", row["id"]).execute()
-    except Exception as e:
-        logger.exception("Agent update failed")
-        raise HTTPException(status_code=500, detail=f"Database update failed: {e}")
-    invalidate_cache(agent_name)
-    _record_agent_version(row["id"], "config", snapshot_before, cleaned)
-
-    try:
-        get_supabase().table("agent_drafts").update(
-            {**cleaned, "has_unpublished_changes": False}
-        ).eq("agent_id", row["id"]).execute()
-    except Exception as e:
-        logger.warning(f"Failed to sync draft after publish for {agent_name}: {e}")
-
-    updated_row = _get_agent_row(agent_name)
-    return _agent_detail_from_row(updated_row)
-
-
-@app.delete("/api/agents/{agent_name:path}")
-async def delete_agent(agent_name: str):
-    """Soft delete an agent."""
-    row = _get_agent_row(agent_name)
-    get_supabase().table("agents").update({"is_active": False}).eq("id", row["id"]).execute()
-    invalidate_cache(agent_name)
-    return {"status": "deleted", "name": agent_name}
-
-
-@app.get("/api/agents/{agent_name:path}/versions")
-async def list_agent_versions(agent_name: str):
-    """Return all version history entries for an agent, newest first."""
-    row = _get_agent_row(agent_name)
-    resp = (
-        get_supabase()
-        .table("agent_versions")
-        .select("*")
-        .eq("agent_id", row["id"])
-        .order("created_at", desc=True)
-        .execute()
-    )
-    return {"agent_name": agent_name, "versions": resp.data or []}
+@app.post("/api/agents/{agent_name:path}/versions")
+async def proxy_create_agent_version(agent_name: str, request: Request):
+    body = await request.json()
+    body.setdefault("agent_id", agent_name)
+    return await _proxy("POST", "/agent-versions", body=body)
 
 
 @app.get("/api/agents/{agent_name:path}/versions/{version_id}")
-async def get_agent_version(agent_name: str, version_id: str):
-    """Return a specific version entry by its row ID."""
-    row = _get_agent_row(agent_name)
-    resp = (
-        get_supabase()
-        .table("agent_versions")
-        .select("*")
-        .eq("id", version_id)
-        .eq("agent_id", row["id"])
-        .limit(1)
-        .execute()
-    )
-    if not resp.data:
-        raise HTTPException(status_code=404, detail=f"Version {version_id} not found")
-    return resp.data[0]
+async def proxy_get_agent_version(agent_name: str, version_id: str):
+    return await _proxy("GET", f"/agent-versions/{agent_name}/{version_id}")
+
+
+@app.get("/api/agents/{agent_name:path}/versions")
+async def proxy_list_agent_versions(agent_name: str):
+    return await _proxy("GET", f"/agent-versions/{agent_name}")
 
 
 @app.get("/api/agents/{agent_name:path}")
-async def get_agent(agent_name: str):
-    """Return full config for a single agent."""
-    row = _get_agent_row(agent_name)
-    return _agent_detail_from_row(row)
+async def proxy_get_agent(agent_name: str):
+    result = await get_agent_config(agent_name)
+    if not result:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_name}")
+    return result
 
 
-# ── Phone number CRUD ───────────────────────────────────────────────────────
+@app.put("/api/agents/{agent_name:path}")
+async def proxy_update_agent(agent_name: str, request: Request):
+    return await _proxy("PUT", f"/agents/{agent_name}", body=await request.json())
+
+
+@app.delete("/api/agents/{agent_name:path}")
+async def proxy_delete_agent(agent_name: str):
+    return await _proxy("DELETE", f"/agents/{agent_name}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PROXY: Call endpoints → Lambda
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/calls/agents")
+async def proxy_call_agent_names():
+    return await _proxy("GET", "/calls/agents")
+
+
+@app.get("/api/calls/{call_id}/recording-url")
+async def proxy_recording_url(call_id: str):
+    call = await _proxy("GET", f"/calls/{call_id}")
+    rec_path = call.get("recording_path") if isinstance(call, dict) else None
+    if not rec_path:
+        raise HTTPException(status_code=404, detail="No recording for this call")
+    url = await _s3_presigned_url(rec_path)
+    return {"url": url}
+
+
+@app.put("/api/calls/{call_id}/hide")
+@app.delete("/api/calls/{call_id}")
+async def proxy_hide_call(call_id: str):
+    """Soft-delete a call. Accepts PUT /api/calls/{id}/hide or DELETE /api/calls/{id}."""
+    return await _proxy("PUT", f"/calls/{call_id}/hide")
+
+
+@app.get("/api/calls/{call_id}")
+async def proxy_get_call(call_id: str):
+    return await _proxy("GET", f"/calls/{call_id}")
+
+
+@app.get("/api/calls")
+async def proxy_list_calls(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    agent_name: Optional[str] = None,
+    agent_display_name: Optional[str] = None,
+    batch_id: Optional[str] = None,
+    status: Optional[str] = None,
+    sort_by: str = Query(default="created_at"),
+    sort_order: str = Query(default="desc"),
+):
+    query: dict[str, str] = {
+        "page": str(page),
+        "page_size": str(page_size),
+        "sort_by": sort_by,
+        "sort_order": sort_order,
+    }
+    if agent_name:
+        query["agent_name"] = agent_name
+    if agent_display_name:
+        query["agent_display_name"] = agent_display_name
+    if batch_id:
+        query["batch_id"] = batch_id
+    if status:
+        query["status"] = status
+    return await _proxy("GET", "/calls", query=query)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PROXY: Batch endpoints → Lambda
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@app.post("/api/batches/upload")
+async def proxy_upload_batch(
+    file: UploadFile = File(...),
+    agent_name: str = Form(...),
+    from_number: str = Form(...),
+):
+    """Receive file, parse rows, upload raw file to S3, create batch + rows in Lambda."""
+    from server.batch_parse import parse_upload_file, build_row_payloads
+
+    raw = await file.read()
+    fname = file.filename or "upload.xlsx"
+
+    try:
+        headers, rows = await asyncio.to_thread(parse_upload_file, raw, fname)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not rows:
+        raise HTTPException(status_code=400, detail="File is empty or has no data rows")
+
+    _phone_col_idx, row_payloads, summary = build_row_payloads(headers, rows)
+
+    batch_id = str(uuid.uuid4())
+    ext = os.path.splitext(fname)[1] or ".xlsx"
+    s3_key = f"batch-files/{batch_id}/input{ext}"
+
+    s3 = _s3_client()
+    await asyncio.to_thread(
+        s3.put_object, Bucket=S3_BUCKET, Key=s3_key, Body=raw,
+        ContentType=file.content_type or "application/octet-stream",
+    )
+
+    agent_display = agent_name
+    try:
+        agent_data = await invoke("GET", f"/agents/{agent_name}")
+        if agent_data and isinstance(agent_data, dict):
+            agent_display = agent_data.get("display_name") or agent_name
+    except Exception:
+        pass
+
+    # Create batch metadata (no rows JSONB anymore)
+    valid_rows = [r for r in row_payloads if r.get("validation") == "valid"]
+    batch = await _proxy("POST", "/batches", body={
+        "id": batch_id,
+        "name": fname,
+        "agent_name": agent_name,
+        "agent_display_name": agent_display,
+        "from_number": from_number,
+        "input_file_path": s3_key,
+        "total_rows": len(valid_rows),
+        "status": "draft",
+    })
+
+    # Insert valid rows into voice_batch_rows
+    if valid_rows:
+        await _proxy("POST", "/batch-rows", body={
+            "batch_id": batch_id,
+            "rows": [
+                {
+                    "row_index": r["row_index"],
+                    "phone_e164": r["phone_e164"],
+                    "case_data": r.get("case_data") or {},
+                }
+                for r in valid_rows
+            ],
+        })
+
+    return {
+        **(batch if isinstance(batch, dict) else {}),
+        "batch_id": batch_id,
+        "columns": headers,
+        "summary": summary,
+        "rows": row_payloads,
+    }
+
+
+@app.delete("/api/batches/cleanup-drafts")
+async def proxy_cleanup_draft_batches():
+    return await _proxy("DELETE", "/batches/cleanup-drafts")
+
+
+@app.put("/api/batches/{batch_id}/rows")
+async def proxy_update_batch_rows(batch_id: str, request: Request):
+    return await _proxy("PUT", f"/batches/{batch_id}/rows", body=await request.json())
+
+
+@app.post("/api/batches/{batch_id}/start")
+async def proxy_start_batch(batch_id: str, request: Request):
+    """Start a batch: persist schedule metadata, then fan rows into SQS."""
+    body = await request.json()
+
+    # Persist any schedule/concurrency overrides on the batch BEFORE fanning out.
+    # We write via PUT /batches/:id to avoid Lambda's POST /start (which flips
+    # status to running prematurely — start_batch does that itself).
+    schedule_fields: dict = {}
+    for key in (
+        "concurrency",
+        "timezone",
+        "calling_window_start",
+        "calling_window_end",
+        "calling_window_days",
+    ):
+        if body.get(key) is not None:
+            schedule_fields[key] = body[key]
+    if schedule_fields:
+        try:
+            await _proxy("PUT", f"/batches/{batch_id}", body=schedule_fields)
+        except HTTPException:
+            logger.exception("Schedule pre-write failed (non-fatal, continuing)")
+
+    result = await _start_batch(batch_id)
+    if isinstance(result, dict) and "http_status" in result:
+        raise HTTPException(status_code=result.pop("http_status"), detail=result)
+    return result
+
+
+@app.post("/api/batches/{batch_id}/pause")
+async def proxy_pause_batch(batch_id: str):
+    return await _pause_batch(batch_id)
+
+
+@app.post("/api/batches/{batch_id}/resume")
+async def proxy_resume_batch(batch_id: str):
+    # Flip the flags, then re-fan any rows still pending (in case they were never queued)
+    await _resume_batch(batch_id)
+    result = await _start_batch(batch_id)
+    if isinstance(result, dict) and "http_status" in result:
+        raise HTTPException(status_code=result.pop("http_status"), detail=result)
+    return result
+
+
+@app.post("/api/batches/{batch_id}/cancel")
+async def proxy_cancel_batch(batch_id: str):
+    return await _cancel_batch(batch_id)
+
+
+@app.get("/api/batches/{batch_id}/status")
+async def proxy_batch_status(batch_id: str):
+    return await _proxy("GET", f"/batches/{batch_id}/status")
+
+
+@app.get("/api/batches/{batch_id}/results")
+async def proxy_batch_results(batch_id: str):
+    """Return a presigned S3 URL for the results file."""
+    batch_data = await get_batch(batch_id)
+    if not batch_data:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    batch = batch_data.get("batch", batch_data)
+    out_path = batch.get("output_file_path")
+    if not out_path:
+        raise HTTPException(status_code=404, detail="Results not ready yet")
+    url = await _s3_presigned_url(out_path)
+    return {"url": url}
+
+
+@app.get("/api/batches/{batch_id}/download-url")
+async def proxy_batch_download_url(batch_id: str):
+    """Presigned S3 URL for the original uploaded file."""
+    batch_data = await get_batch(batch_id)
+    if not batch_data:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    batch = batch_data.get("batch", batch_data)
+    path = batch.get("input_file_path")
+    if not path:
+        raise HTTPException(status_code=404, detail="No file for this batch")
+    url = await _s3_presigned_url(path)
+    return {"url": url}
+
+
+@app.delete("/api/batches/{batch_id}/draft")
+async def proxy_delete_draft_batch(batch_id: str):
+    return await _proxy("DELETE", f"/batches/{batch_id}/draft")
+
+
+@app.get("/api/batches/{batch_id}")
+async def proxy_get_batch(batch_id: str):
+    return await _proxy("GET", f"/batches/{batch_id}")
+
+
+@app.get("/api/batches")
+async def proxy_list_batches():
+    return await _proxy("GET", "/batches")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PROXY: Batch rows + system config → Lambda
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/batch-rows/progress")
+async def proxy_batch_row_progress(batch_id: str):
+    return await _proxy("GET", "/batch-rows/progress", query={"batch_id": batch_id})
+
+
+@app.get("/api/batch-rows")
+async def proxy_list_batch_rows(
+    batch_id: str,
+    status: str | None = None,
+    limit: int | None = None,
+):
+    params: dict[str, str] = {"batch_id": batch_id}
+    if status:
+        params["status"] = status
+    if limit:
+        params["limit"] = str(limit)
+    return await _proxy("GET", "/batch-rows", query=params)
+
+
+@app.post("/api/batch-rows")
+async def proxy_create_batch_rows(request: Request):
+    return await _proxy("POST", "/batch-rows", body=await request.json())
+
+
+@app.get("/api/batch-rows/{row_id}")
+async def proxy_get_batch_row(row_id: str):
+    return await _proxy("GET", f"/batch-rows/{row_id}")
+
+
+@app.put("/api/batch-rows/{row_id}")
+async def proxy_update_batch_row(row_id: str, request: Request):
+    return await _proxy("PUT", f"/batch-rows/{row_id}", body=await request.json())
+
+
+@app.get("/api/system-config/{key}")
+async def proxy_get_system_config(key: str):
+    return await _proxy("GET", f"/system-config/{key}")
+
+
+@app.put("/api/system-config/{key}")
+async def proxy_set_system_config(key: str, request: Request):
+    return await _proxy("PUT", f"/system-config/{key}", body=await request.json())
+
+
+@app.post("/api/batches/{batch_id}/execute")
+async def execute_batch(batch_id: str):
+    """Alias for /start — fan batch rows into SQS for the unified consumer."""
+    result = await _start_batch(batch_id)
+    if isinstance(result, dict) and "http_status" in result:
+        raise HTTPException(status_code=result.pop("http_status"), detail=result)
+    return result
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PROXY: Phone number endpoints → Lambda
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 @app.get("/api/phone-numbers")
-async def list_phone_numbers():
-    """List all active phone numbers with joined agent info."""
-    resp = get_supabase().table("phone_numbers").select("*").eq("is_active", True).order("number").execute()
-    rows = resp.data or []
-
-    agent_ids = set()
-    for r in rows:
-        if r.get("inbound_agent_id"):
-            agent_ids.add(r["inbound_agent_id"])
-        if r.get("outbound_agent_id"):
-            agent_ids.add(r["outbound_agent_id"])
-
-    agents_map: dict[str, dict] = {}
-    if agent_ids:
-        agent_resp = (
-            get_supabase()
-            .table("agents")
-            .select("id, name, display_name")
-            .in_("id", list(agent_ids))
-            .execute()
-        )
-        for a in (agent_resp.data or []):
-            agents_map[a["id"]] = {"id": a["id"], "name": a["name"], "display_name": a["display_name"]}
-
-    result = []
-    for r in rows:
-        result.append({
-            "id": r["id"],
-            "number": r["number"],
-            "friendly_name": r.get("friendly_name", ""),
-            "inbound_agent": agents_map.get(r.get("inbound_agent_id")),
-            "outbound_agent": agents_map.get(r.get("outbound_agent_id")),
-            "is_active": r.get("is_active", True),
-            "created_at": r.get("created_at"),
-            "updated_at": r.get("updated_at"),
-        })
-    return {"phone_numbers": result}
-
-
-@app.post("/api/phone-numbers")
-async def create_phone_number(payload: CreatePhoneNumberRequest):
-    """Add a new phone number."""
-    existing = get_supabase().table("phone_numbers").select("id").eq("number", payload.number).limit(1).execute()
-    if existing.data:
-        raise HTTPException(status_code=409, detail=f"Phone number {payload.number} already exists")
-
-    for field_name in ("inbound_agent_id", "outbound_agent_id"):
-        aid = getattr(payload, field_name, None)
-        if aid:
-            check = get_supabase().table("agents").select("id").eq("id", aid).eq("is_active", True).limit(1).execute()
-            if not check.data:
-                label = field_name.replace("_", " ").replace(" id", "")
-                raise HTTPException(status_code=400, detail=f"{label} '{aid}' not found or inactive")
-
-    row = {
-        "number": payload.number,
-        "friendly_name": payload.friendly_name,
-        "inbound_agent_id": payload.inbound_agent_id,
-        "outbound_agent_id": payload.outbound_agent_id,
-    }
-    try:
-        resp = get_supabase().table("phone_numbers").insert(row).execute()
-    except Exception as e:
-        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
-            raise HTTPException(status_code=409, detail=f"Phone number {payload.number} already exists")
-        raise
-    if not resp.data:
-        raise HTTPException(status_code=500, detail="Failed to create phone number")
-    return resp.data[0]
-
-
-@app.put("/api/phone-numbers/{phone_id}")
-async def update_phone_number(phone_id: str, payload: UpdatePhoneNumberRequest):
-    """Update a phone number's friendly name or agent assignments."""
-    cols = payload.model_dump(exclude_none=True)
-    if not cols:
-        raise HTTPException(status_code=400, detail="No fields to update")
-
-    for field_name in ("inbound_agent_id", "outbound_agent_id"):
-        aid = cols.get(field_name)
-        if aid is not None:
-            check = get_supabase().table("agents").select("id").eq("id", aid).eq("is_active", True).limit(1).execute()
-            if not check.data:
-                label = field_name.replace("_", " ").replace(" id", "")
-                raise HTTPException(status_code=400, detail=f"{label} {aid} not found or inactive")
-
-    resp = get_supabase().table("phone_numbers").update(cols).eq("id", phone_id).execute()
-    if not resp.data:
-        raise HTTPException(status_code=404, detail="Phone number not found")
-    return resp.data[0]
-
-
-@app.delete("/api/phone-numbers/{phone_id}")
-async def delete_phone_number(phone_id: str):
-    """Soft delete a phone number."""
-    resp = (
-        get_supabase()
-        .table("phone_numbers")
-        .update({"is_active": False})
-        .eq("id", phone_id)
-        .execute()
-    )
-    if not resp.data:
-        raise HTTPException(status_code=404, detail="Phone number not found")
-    return {"status": "deleted", "id": phone_id}
+async def proxy_list_phones():
+    return await _proxy("GET", "/phone-numbers")
 
 
 @app.post("/api/phone-numbers/sync-twilio")
 async def sync_twilio_numbers():
-    """Fetch all phone numbers from Twilio and upsert into phone_numbers table."""
-    from twilio.rest import Client
+    """Pull phone numbers from the Twilio account and upsert into Aurora."""
+    from twilio.rest import Client as TwilioClient
 
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    if not account_sid or not auth_token:
+    sid = os.getenv("TWILIO_ACCOUNT_SID")
+    token = os.getenv("TWILIO_AUTH_TOKEN")
+    if not sid or not token:
         raise HTTPException(status_code=500, detail="Twilio credentials not configured")
 
-    client = Client(account_sid, auth_token)
-    supabase = get_supabase()
+    client = TwilioClient(sid, token)
+    twilio_numbers = await asyncio.to_thread(client.incoming_phone_numbers.list)
 
     synced = []
-    for number in client.incoming_phone_numbers.stream():
-        existing = (
-            supabase.table("phone_numbers")
-            .select("id, friendly_name")
-            .eq("number", number.phone_number)
-            .limit(1)
-            .execute()
-        )
-        if existing.data:
-            existing_name = existing.data[0].get("friendly_name", "")
-            if not existing_name or existing_name == number.phone_number:
-                supabase.table("phone_numbers").update({
-                    "friendly_name": number.friendly_name or "",
-                }).eq("id", existing.data[0]["id"]).execute()
-            synced.append({"number": number.phone_number, "status": "exists"})
-        else:
-            supabase.table("phone_numbers").insert({
-                "number": number.phone_number,
-                "friendly_name": number.friendly_name or "",
-                "is_active": True,
-            }).execute()
-            synced.append({"number": number.phone_number, "status": "added"})
-
-    return {"synced": synced, "total": len(synced)}
-
-
-@app.get("/api/phone-numbers/search")
-async def search_available_numbers(
-    country: str = "US",
-    area_code: str | None = None,
-    contains: str | None = None,
-    limit: int = 20,
-):
-    """Search Twilio's available phone number inventory."""
-    from twilio.rest import Client
-
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    if not account_sid or not auth_token:
-        raise HTTPException(status_code=500, detail="Twilio credentials not configured")
-
-    client = Client(account_sid, auth_token)
-
-    kwargs: dict = {"limit": min(limit, 30)}
-    if area_code:
-        kwargs["area_code"] = area_code
-    if contains:
-        kwargs["contains"] = contains
-
-    numbers = client.available_phone_numbers(country).local.list(**kwargs)
+    errors = []
+    for num in twilio_numbers:
+        data = {
+            "number": num.phone_number,
+            "friendly_name": num.friendly_name or num.phone_number,
+        }
+        try:
+            await _proxy("POST", "/phone-numbers", body=data)
+            synced.append(data)
+        except Exception as e:
+            errors.append({"number": num.phone_number, "error": str(e)})
 
     return {
-        "numbers": [
-            {
-                "number": n.phone_number,
-                "friendly_name": n.friendly_name,
-                "locality": n.locality,
-                "region": n.region,
-                "capabilities": {
-                    "voice": n.capabilities.get("voice", False),
-                    "sms": n.capabilities.get("SMS", False),
-                    "mms": n.capabilities.get("MMS", False),
-                },
-            }
-            for n in numbers
-        ],
-        "country": country,
-        "count": len(numbers),
+        "status": "synced",
+        "synced": len(synced),
+        "errors": len(errors),
+        "numbers": synced,
+        "error_details": errors if errors else None,
     }
 
 
-@app.post("/api/phone-numbers/purchase")
-async def purchase_number(payload: PurchasePhoneNumberRequest):
-    """Purchase a number from Twilio and add it to our phone_numbers table."""
-    phone_number = payload.number
-    friendly_name = payload.friendly_name
-
-    supabase = get_supabase()
-    existing = supabase.table("phone_numbers") \
-        .select("*").eq("number", phone_number).limit(1).execute()
-    if existing.data:
-        return {
-            "status": "already_owned",
-            "number": existing.data[0]["number"],
-            "phone_number_record": existing.data[0],
-        }
-
-    from twilio.rest import Client
-
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    if not account_sid or not auth_token:
-        raise HTTPException(status_code=500, detail="Twilio credentials not configured")
-
-    client = Client(account_sid, auth_token)
-
-    try:
-        purchased = client.incoming_phone_numbers.create(
-            phone_number=phone_number,
-            friendly_name=friendly_name or phone_number,
-        )
-
-        result = supabase.table("phone_numbers").insert({
-            "number": purchased.phone_number,
-            "friendly_name": friendly_name or purchased.friendly_name or "",
-            "is_active": True,
-        }).execute()
-
-        return {
-            "status": "purchased",
-            "number": purchased.phone_number,
-            "sid": purchased.sid,
-            "monthly_cost": "$2.00",
-            "phone_number_record": result.data[0] if result.data else None,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Purchase failed: {e}")
+@app.post("/api/phone-numbers")
+async def proxy_create_phone(request: Request):
+    return await _proxy("POST", "/phone-numbers", body=await request.json())
 
 
-@app.post("/api/phone-numbers/{phone_number_id}/release")
-async def release_number(phone_number_id: str):
-    """Release a number back to Twilio and remove from our system."""
-    supabase = get_supabase()
-
-    resp = supabase.table("phone_numbers").select("*").eq("id", phone_number_id).limit(1).execute()
-    if not resp.data:
-        raise HTTPException(status_code=404, detail="Phone number not found")
-
-    number = resp.data[0]["number"]
-
-    from twilio.rest import Client
-
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    if not account_sid or not auth_token:
-        raise HTTPException(status_code=500, detail="Twilio credentials not configured")
-
-    client = Client(account_sid, auth_token)
-
-    try:
-        twilio_numbers = client.incoming_phone_numbers.list(phone_number=number)
-        if twilio_numbers:
-            twilio_numbers[0].delete()
-
-        supabase.table("phone_numbers").delete().eq("id", phone_number_id).execute()
-
-        return {"status": "released", "number": number}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Release failed: {e}")
+@app.put("/api/phone-numbers/{phone_id}")
+async def proxy_update_phone(phone_id: str, request: Request):
+    body = await request.json()
+    for field in ("inbound_agent_id", "outbound_agent_id"):
+        val = body.get(field)
+        if val and not _is_uuid(val):
+            agent = await invoke("GET", f"/agents/{val}")
+            if agent and isinstance(agent, dict) and agent.get("id"):
+                body[field] = agent["id"]
+            else:
+                body[field] = None
+    return await _proxy("PUT", f"/phone-numbers/{phone_id}", body=body)
 
 
-# ── Voice library ────────────────────────────────────────────────────────────
+@app.delete("/api/phone-numbers/{phone_id}")
+async def proxy_delete_phone(phone_id: str):
+    return await _proxy("DELETE", f"/phone-numbers/{phone_id}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PROXY: Call request queue → Lambda
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@app.post("/api/call-requests")
+async def proxy_create_call_request(request: Request):
+    body = await request.json()
+    validation_errors = await validate_agent_ready(body.get("agent_name", ""))
+    if validation_errors:
+        raise HTTPException(status_code=400, detail={
+            "error": "Agent not ready for calls",
+            "issues": validation_errors,
+        })
+    return await _proxy("POST", "/call-requests", body=body)
+
+
+@app.get("/api/call-requests")
+async def proxy_list_call_requests(
+    status: str | None = None,
+    agent_name: str | None = None,
+    trigger_source: str | None = None,
+):
+    params = {}
+    if status:
+        params["status"] = status
+    if agent_name:
+        params["agent_name"] = agent_name
+    if trigger_source:
+        params["trigger_source"] = trigger_source
+    return await _proxy("GET", "/call-requests", query=params)
+
+
+@app.get("/api/call-requests/{request_id}")
+async def proxy_get_call_request(request_id: str):
+    return await _proxy("GET", f"/call-requests/{request_id}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PROXY: Voice endpoints → Lambda
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 @app.get("/api/voices")
-async def list_voices():
-    """List all voices in the voice library."""
-    result = get_supabase().table("voice_library") \
-        .select("*") \
-        .eq("is_active", True) \
-        .order("name") \
-        .execute()
-    return {"voices": result.data or []}
-
-
-@app.get("/api/voices/{voice_id}")
-async def get_voice(voice_id: str):
-    """Get a single voice from the library."""
-    result = get_supabase().table("voice_library") \
-        .select("*") \
-        .eq("voice_id", voice_id) \
-        .eq("is_active", True) \
-        .limit(1) \
-        .execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail=f"Voice not found: {voice_id}")
-    return result.data[0]
+async def proxy_list_voices():
+    return await _proxy("GET", "/voices")
 
 
 @app.post("/api/voices/lookup")
-async def lookup_voice(payload: VoiceLookupRequest):
-    """Look up a voice ID on ElevenLabs without adding to library."""
-    voice_id = payload.voice_id
-
-    api_key = os.getenv("ELEVENLABS_API_KEY")
+async def proxy_voice_lookup(request: Request):
+    body = await request.json()
+    try:
+        result = await _proxy("POST", "/voices/lookup", body=body)
+        if isinstance(result, dict) and result.get("voice_id"):
+            return result
+    except HTTPException:
+        pass
+    voice_id = body.get("voice_id", "")
+    if not voice_id:
+        raise HTTPException(status_code=400, detail="voice_id required")
     import httpx
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             f"https://api.elevenlabs.io/v1/voices/{voice_id}",
-            headers={"xi-api-key": api_key},
+            headers={"xi-api-key": os.getenv("ELEVENLABS_API_KEY", "")},
         )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=404, detail="Voice not found on ElevenLabs")
+        v = resp.json()
+        labels = v.get("labels", {})
+        return {
+            "voice_id": v.get("voice_id"),
+            "name": v.get("name"),
+            "description": v.get("description"),
+            "preview_url": v.get("preview_url"),
+            "gender": labels.get("gender"),
+            "accent": labels.get("accent"),
+            "age": labels.get("age"),
+            "category": v.get("category"),
+            "labels": labels,
+        }
 
-    if resp.status_code == 404:
-        raise HTTPException(status_code=404, detail="Voice not found on ElevenLabs")
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"ElevenLabs API error: {resp.status_code}")
 
-    data = resp.json()
-    labels = data.get("labels", {})
-    return {
-        "voice_id": data["voice_id"],
-        "name": data.get("name", "Unknown"),
-        "description": data.get("description", ""),
-        "category": data.get("category", ""),
-        "preview_url": data.get("preview_url", ""),
-        "gender": labels.get("gender", ""),
-        "accent": labels.get("accent", ""),
-        "age": labels.get("age", ""),
-        "use_case": labels.get("use_case", ""),
-    }
+async def _fetch_elevenlabs_voice(voice_id: str) -> dict | None:
+    """Fetch voice metadata from ElevenLabs API."""
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"https://api.elevenlabs.io/v1/voices/{voice_id}",
+                headers={"xi-api-key": os.getenv("ELEVENLABS_API_KEY", "")},
+            )
+            if resp.status_code != 200:
+                return None
+            v = resp.json()
+            labels = v.get("labels", {})
+            return {
+                "voice_id": v.get("voice_id"),
+                "name": v.get("name"),
+                "description": v.get("description"),
+                "preview_url": v.get("preview_url"),
+                "gender": labels.get("gender"),
+                "accent": labels.get("accent"),
+                "age": labels.get("age"),
+                "category": v.get("category"),
+                "labels": labels,
+            }
+    except Exception:
+        return None
 
 
 @app.post("/api/voices/add")
-async def add_voice(payload: VoiceAddRequest):
-    """Add a voice to the library by looking it up on ElevenLabs."""
-    voice_id = payload.voice_id
-    custom_name = payload.name.strip()
-
-    api_key = os.getenv("ELEVENLABS_API_KEY")
-    import httpx
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"https://api.elevenlabs.io/v1/voices/{voice_id}",
-            headers={"xi-api-key": api_key},
-        )
-
-    if resp.status_code == 404:
-        raise HTTPException(status_code=404, detail="Voice not found on ElevenLabs")
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"ElevenLabs API error: {resp.status_code}")
-
-    data = resp.json()
-    labels = data.get("labels", {})
-    voice_row = {
-        "voice_id": data["voice_id"],
-        "name": custom_name or data.get("name", "Unknown"),
-        "description": data.get("description", ""),
-        "category": data.get("category", ""),
-        "preview_url": data.get("preview_url", ""),
-        "gender": labels.get("gender", ""),
-        "accent": labels.get("accent", ""),
-        "age": labels.get("age", ""),
-        "use_case": labels.get("use_case", ""),
-        "is_active": True,
-    }
-
-    result = get_supabase().table("voice_library") \
-        .upsert(voice_row, on_conflict="voice_id") \
-        .execute()
-
-    return {"status": "added", "voice": result.data[0] if result.data else voice_row}
+async def proxy_voice_add(request: Request):
+    body = await request.json()
+    voice_id = body.get("voice_id", "")
+    meta = await _fetch_elevenlabs_voice(voice_id) if voice_id else None
+    if meta:
+        body.update({k: v for k, v in meta.items() if v is not None and k not in ("voice_id",)})
+    return await _proxy("POST", "/voices/add", body=body)
 
 
 @app.post("/api/voices/{voice_id}/refresh")
-async def refresh_voice(voice_id: str):
-    """Re-fetch voice metadata from ElevenLabs and update the local record."""
-    existing = get_supabase().table("voice_library") \
-        .select("voice_id").eq("voice_id", voice_id).limit(1).execute()
-    if not existing.data:
-        raise HTTPException(status_code=404, detail=f"Voice {voice_id} not found in library")
-
-    api_key = os.getenv("ELEVENLABS_API_KEY")
-    import httpx
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"https://api.elevenlabs.io/v1/voices/{voice_id}",
-            headers={"xi-api-key": api_key},
-        )
-
-    if resp.status_code == 404:
-        raise HTTPException(status_code=404, detail="Voice no longer exists on ElevenLabs")
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"ElevenLabs API error: {resp.status_code}")
-
-    data = resp.json()
-    labels = data.get("labels", {})
-    updates = {
-        "name": data.get("name", "Unknown"),
-        "description": data.get("description", ""),
-        "category": data.get("category", ""),
-        "preview_url": data.get("preview_url", ""),
-        "gender": labels.get("gender", ""),
-        "accent": labels.get("accent", ""),
-        "age": labels.get("age", ""),
-        "use_case": labels.get("use_case", ""),
-    }
-
-    result = get_supabase().table("voice_library") \
-        .update(updates).eq("voice_id", voice_id).execute()
-
-    return {"status": "refreshed", "voice_id": voice_id, "voice": result.data[0] if result.data else updates}
-
-
-@app.delete("/api/voices/{voice_id}")
-async def remove_voice(voice_id: str):
-    """Soft-delete a voice from the library. Blocked if any agent uses it."""
-    agents_using = get_supabase().table("agents") \
-        .select("name, display_name") \
-        .eq("tts_voice_id", voice_id) \
-        .eq("is_active", True) \
-        .execute()
-
-    if agents_using.data:
-        agent_names = [a["display_name"] for a in agents_using.data]
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot remove — voice is in use by: {', '.join(agent_names)}",
-        )
-
-    result = get_supabase().table("voice_library") \
-        .update({"is_active": False}) \
-        .eq("voice_id", voice_id) \
-        .execute()
-
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Voice not found")
-    return {"status": "removed", "voice_id": voice_id}
+async def proxy_voice_refresh(voice_id: str):
+    meta = await _fetch_elevenlabs_voice(voice_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Voice not found on ElevenLabs")
+    await _proxy("POST", "/voices/add", body=meta)
+    return meta
 
 
 @app.get("/api/voices/{voice_id}/agents")
-async def get_voice_agents(voice_id: str):
-    """List which agents use a given voice."""
-    result = get_supabase().table("agents") \
-        .select("id, name, display_name") \
-        .eq("tts_voice_id", voice_id) \
-        .eq("is_active", True) \
-        .execute()
-    return {"agents": result.data or []}
+async def proxy_voice_agents(voice_id: str):
+    return await _proxy("GET", f"/voices/{voice_id}/agents")
 
 
-# ── Outbound calls ──────────────────────────────────────────────────────────
+@app.get("/api/voices/{voice_id}")
+async def proxy_get_voice(voice_id: str):
+    return await _proxy("GET", f"/voices/{voice_id}")
+
+
+@app.delete("/api/voices/{voice_id}")
+async def proxy_delete_voice(voice_id: str):
+    return await _proxy("DELETE", f"/voices/{voice_id}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PROXY: Payer & template endpoints → Lambda (new data)
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/payers")
+async def proxy_list_payers():
+    return await list_payers() or []
+
+
+@app.get("/api/payers/{payer_id}")
+async def proxy_get_payer(payer_id: str):
+    result = await get_payer(payer_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Payer not found")
+    return result
+
+
+@app.get("/api/claim-context/{claim_id}")
+async def proxy_get_claim_context(claim_id: str):
+    result = await get_claim_context(claim_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Claim context not found")
+    return result
+
+
+@app.get("/api/call-templates")
+async def proxy_list_templates():
+    return await list_call_templates() or []
+
+
+@app.get("/api/call-templates/{template_name}")
+async def proxy_get_template(template_name: str):
+    result = await get_call_template(template_name)
+    if not result:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return result
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CALLING ENGINE: Outbound calls
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 @app.post("/api/calls/outbound", response_model=OutboundCallResponse)
@@ -927,532 +955,133 @@ async def outbound_call(req: OutboundCallRequest):
     )
 
 
-# ── Call read endpoints ──────────────────────────────────────────────────────
-
-
-@app.get("/api/calls/agents", response_model=CallAgentNamesResponse)
-async def get_call_agent_names():
-    """Unique agent display names from actual call records.
-
-    Includes deleted agents and historical names from before renames,
-    so the filter dropdown always matches what appears in the Agent column.
-    """
-    result = get_supabase().table("calls") \
-        .select("agent_name, agent_display_name").execute()
-
-    seen: dict[str, str] = {}
-    for r in (result.data or []):
-        display = r.get("agent_display_name") or r.get("agent_name") or ""
-        slug = r.get("agent_name") or ""
-        if display and display not in seen:
-            seen[display] = slug
-
-    agents = sorted(
-        [{"display_name": name, "agent_name": slug} for name, slug in seen.items()],
-        key=lambda x: x["display_name"],
-    )
-    return CallAgentNamesResponse(agents=agents)
-
-
-@app.get("/api/calls/{call_id}/recording-url", response_model=SignedUrlResponse)
-async def get_recording_url(call_id: str):
-    """Generate a signed URL for a call's recording."""
-    call = get_supabase().table("calls") \
-        .select("recording_path").eq("id", call_id).limit(1).execute()
-    if not call.data:
-        raise HTTPException(status_code=404, detail=f"Call {call_id} not found")
-
-    path = call.data[0].get("recording_path")
-    if not path:
-        raise HTTPException(status_code=404, detail="No recording for this call")
-
-    try:
-        signed = get_supabase().storage.from_("recordings").create_signed_url(path, 3600)
-        url = (
-            signed.get("signedURL")
-            or signed.get("signedUrl")
-            or (getattr(signed, "signed_url", None))
-        )
-        if not url:
-            raise HTTPException(
-                status_code=500, detail=f"Storage returned no URL for path: {path}"
-            )
-        return SignedUrlResponse(url=str(url))
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to create signed URL for recording {path}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to generate recording URL")
-
-
-@app.get("/api/calls/{call_id}")
-async def get_call_detail(call_id: str):
-    """Return full call record including transcript and analysis."""
-    result = get_supabase().table("calls") \
-        .select("*").eq("id", call_id).limit(1).execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail=f"Call {call_id} not found")
-    return result.data[0]
-
-
-@app.get("/api/calls", response_model=PaginatedCallsResponse)
-async def list_calls(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=25, ge=1, le=100),
-    agent_name: str | None = None,
-    agent_display_name: str | None = None,
-    batch_id: str | None = None,
-    status: str | None = None,
-    sort_by: str = Query(
-        default="created_at",
-        pattern=r"^(created_at|status|duration_secs|agent_name)$",
-    ),
-    sort_order: str = Query(default="desc", pattern=r"^(asc|desc)$"),
-):
-    """Paginated call list with optional filters."""
-    query = get_supabase().table("calls").select("*", count="exact")
-
-    if agent_display_name:
-        query = query.eq("agent_display_name", agent_display_name)
-    elif agent_name:
-        query = query.eq("agent_name", agent_name)
-    if batch_id:
-        query = query.eq("batch_id", batch_id)
-    if status:
-        query = query.eq("status", status)
-
-    query = query.order(sort_by, desc=(sort_order == "desc"))
-
-    offset = (page - 1) * page_size
-    query = query.range(offset, offset + page_size - 1)
-
-    result = query.execute()
-    return PaginatedCallsResponse(
-        calls=result.data or [],
-        total=result.count or 0,
-        page=page,
-        page_size=page_size,
-    )
-
-
-# ── Batch operations ────────────────────────────────────────────────────────
-
-
-@app.post("/api/batches/upload", response_model=UploadBatchResponse)
-async def upload_batch(
-    file: UploadFile = File(...),
-    agent_name: str = Form(...),
-    from_number: str = Form(...),
-):
-    """Upload Excel/CSV for batch validation and storage."""
-    if not os.getenv("SUPABASE_URL") or not os.getenv("SUPABASE_SERVICE_KEY"):
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "Supabase is not configured"},
-        )
-
-    if not E164_RE.match(from_number):
-        return JSONResponse(status_code=400, content={"detail": "from_number must be E.164 format"})
-
-    fname = (file.filename or "").lower()
-    allowed_ext = (".csv", ".xlsx", ".xls", ".xlsm")
-    if not any(fname.endswith(ext) for ext in allowed_ext):
-        return JSONResponse(
-            status_code=400,
-            content={"detail": f"Unsupported file type. Please upload CSV or Excel ({', '.join(allowed_ext)})"},
-        )
-
-    raw = await file.read()
-    fname = file.filename or "upload.xlsx"
-    try:
-        headers, rows = parse_upload_file(raw, fname)
-    except ValueError as e:
-        return JSONResponse(status_code=400, content={"detail": str(e)})
-
-    phone_idx, payloads, summary = build_row_payloads(headers, rows)
-    batch_id = str(uuid.uuid4())
-    ext = os.path.splitext(fname)[1] or ".xlsx"
-    storage_path = f"batch-files/{batch_id}/input{ext}"
-    ct = file.content_type or "application/octet-stream"
-    await asyncio.to_thread(_storage_upload_batch_file, storage_path, raw, ct)
-
-    try:
-        agent_row = get_supabase().table("agents") \
-            .select("display_name").eq("name", agent_name).limit(1).execute()
-        agent_display_name = agent_row.data[0].get("display_name", agent_name) if agent_row.data else agent_name
-    except Exception:
-        agent_display_name = agent_name
-
-    row = {
-        "id": batch_id,
-        "name": fname,
-        "agent_name": agent_name,
-        "agent_display_name": agent_display_name,
-        "from_number": from_number,
-        "status": "draft",
-        "total_rows": summary["valid"],
-        "completed_rows": 0,
-        "failed_rows": 0,
-        "rows": payloads,
-        "input_file_path": storage_path,
-    }
-    await insert_batch(row)
-
-    return UploadBatchResponse(
-        batch_id=batch_id,
-        columns=headers,
-        phone_column_index=phone_idx,
-        summary=summary,
-        rows=[
-            UploadRowResponse(
-                row_index=p["row_index"],
-                validation=p["validation"],
-                phone_raw=p.get("phone_raw", ""),
-                phone_e164=p["phone_e164"],
-                data=p.get("case_data") or {},
-            )
-            for p in payloads
-        ],
-    )
-
-
-@app.put("/api/batches/{batch_id}/rows", response_model=UpdateBatchRowsResponse)
-async def update_batch_rows(batch_id: str, payload: UpdateBatchRowsRequest):
-    """Single transformation point — frontend rows → runner-ready rows_data."""
-    from server.batch_parse import detect_phone_column
-
-    logger.info(
-        f"[BATCH ROWS] batch={batch_id} incoming={len(payload.rows)} "
-        f"mapping_keys={list(payload.column_mapping.keys())[:5]}"
-    )
-
-    variable_map: dict[str, str] = {}
-    phone_source_col: str | None = None
-    for csv_col, target in payload.column_mapping.items():
-        if target == "__phone__":
-            phone_source_col = csv_col
-        elif target and target != "__skip__":
-            variable_map[csv_col] = target
-
-    mapped_rows: list[dict] = []
-    skipped_invalid: list[int] = []
-
-    for row in payload.rows:
-        if row.excluded:
-            continue
-
-        raw_phone = row.phone
-        if not raw_phone and phone_source_col:
-            raw_phone = row.data.get(phone_source_col, "")
-        if not raw_phone:
-            keys = list(row.data.keys())
-            pi = detect_phone_column(keys)
-            if pi is not None and pi < len(keys):
-                raw_phone = str(row.data[keys[pi]]).strip()
-
-        phone = normalize_phone(raw_phone)
-        if not phone or len(phone) < 12:
-            skipped_invalid.append(row.index)
-            continue
-
-        if variable_map:
-            case_data = {}
-            for csv_col, agent_var in variable_map.items():
-                val = row.data.get(csv_col, "")
-                case_data[agent_var] = str(val).strip() if val else ""
-        else:
-            case_data = {k: str(v).strip() if v else "" for k, v in row.data.items()}
-
-        mapped_rows.append({
-            "row_index": row.index,
-            "phone_e164": phone,
-            "validation": "valid",
-            "case_data": case_data,
-        })
-
-    if not mapped_rows:
-        detail = "No valid rows to process"
-        if skipped_invalid:
-            detail += f". {len(skipped_invalid)} rows had invalid phone numbers."
-        raise HTTPException(status_code=400, detail=detail)
-
-    if skipped_invalid:
-        logger.warning(
-            f"[BATCH ROWS] batch={batch_id} skipped {len(skipped_invalid)} "
-            f"rows with invalid phones"
-        )
-
-    update_result = (
-        get_supabase()
-        .table("batches")
-        .update({
-            "rows_data": mapped_rows,
-            "column_mapping": payload.column_mapping,
-            "total_rows": len(mapped_rows),
-            "rows": [],
-        })
-        .eq("id", batch_id)
-        .execute()
-    )
-    if not update_result.data:
-        raise HTTPException(status_code=404, detail=f"Batch not found: {batch_id}")
-
-    logger.info(
-        f"[BATCH ROWS] batch={batch_id} saved {len(mapped_rows)} dialable rows"
-    )
-    return UpdateBatchRowsResponse(
-        batch_id=batch_id,
-        total_rows=len(mapped_rows),
-        skipped_invalid=len(skipped_invalid),
-    )
-
-
-@app.post("/api/batches/{batch_id}/start", response_model=StartBatchResponse)
-async def start_batch(batch_id: str, payload: StartBatchRequest):
-    """Start (or schedule) a batch with atomic double-click protection."""
-    if payload.schedule_mode == "now":
-        win_start = "00:00:00"
-        win_end = "23:59:59"
-        win_days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    else:
-        win_start = payload.calling_window_start
-        win_end = payload.calling_window_end
-        win_days = payload.calling_window_days or [
-            "Mon", "Tue", "Wed", "Thu", "Fri"
-        ]
-
-    update_fields: dict = {
-        "status": "scheduled",
-        "concurrency": min(payload.concurrency, MAX_SERVER_CONCURRENCY),
-        "timezone": payload.timezone,
-        "calling_window_start": win_start,
-        "calling_window_end": win_end,
-        "calling_window_days": win_days,
-        "schedule_mode": payload.schedule_mode,
-    }
-    if payload.start_date:
-        update_fields["start_date"] = payload.start_date
-
-    result = (
-        get_supabase()
-        .table("batches")
-        .update(update_fields)
-        .eq("id", batch_id)
-        .in_("status", ["draft", "ready"])
-        .execute()
-    )
-    if not result.data:
-        check = (
-            get_supabase()
-            .table("batches")
-            .select("status")
-            .eq("id", batch_id)
-            .limit(1)
-            .execute()
-        )
-        if check.data and check.data[0].get("status") in ("running", "scheduled"):
-            return StartBatchResponse(
-                status="already_running", batch_id=batch_id
-            )
-        if not check.data:
-            raise HTTPException(status_code=404, detail="batch not found")
-        raise HTTPException(
-            status_code=400,
-            detail=f"batch status is {check.data[0].get('status')!r}, cannot start",
-        )
-
-    asyncio.create_task(run_batch(_pending_calls, batch_id))
-    return StartBatchResponse(
-        status="scheduled",
-        batch_id=batch_id,
-        total_calls=result.data[0].get("total_rows", 0),
-    )
-
-
-@app.post("/api/batches/{batch_id}/pause", response_model=BatchControlResponse)
-async def pause_batch(batch_id: str):
-    """User-initiated pause — runner will stop dialing new rows."""
-    result = (
-        get_supabase()
-        .table("batches")
-        .update({"paused_by_user": True, "status": "paused"})
-        .eq("id", batch_id)
-        .in_("status", ["running", "scheduled"])
-        .execute()
-    )
-    if not result.data:
-        raise HTTPException(status_code=400, detail="Batch cannot be paused")
-    return BatchControlResponse(status="paused", batch_id=batch_id)
-
-
-@app.post("/api/batches/{batch_id}/resume", response_model=BatchControlResponse)
-async def resume_batch(batch_id: str):
-    """Resume a user-paused batch."""
-    result = (
-        get_supabase()
-        .table("batches")
-        .update({"paused_by_user": False, "status": "scheduled"})
-        .eq("id", batch_id)
-        .eq("status", "paused")
-        .execute()
-    )
-    if not result.data:
-        raise HTTPException(status_code=400, detail="Batch cannot be resumed")
-    return BatchControlResponse(status="resumed", batch_id=batch_id)
-
-
-@app.post("/api/batches/{batch_id}/cancel", response_model=BatchControlResponse)
-async def cancel_batch(batch_id: str):
-    """Cancel a running, scheduled, or paused batch."""
-    result = (
-        get_supabase()
-        .table("batches")
-        .update({"status": "canceled"})
-        .eq("id", batch_id)
-        .in_("status", ["running", "scheduled", "paused"])
-        .execute()
-    )
-    if not result.data:
-        raise HTTPException(status_code=400, detail="Batch cannot be canceled")
-    return BatchControlResponse(status="canceled", batch_id=batch_id)
-
-
-@app.delete("/api/batches/cleanup-drafts")
-async def cleanup_draft_batches():
-    """Delete abandoned draft/ready batches older than 24 hours."""
-    from datetime import datetime, timedelta, timezone
-
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    result = get_supabase().table("batches") \
-        .delete() \
-        .in_("status", ["draft", "ready"]) \
-        .lt("created_at", cutoff) \
-        .execute()
-    deleted = len(result.data) if result.data else 0
-    return {"status": "cleaned", "deleted": deleted}
-
-
-@app.get("/api/batches", response_model=BatchListResponse)
-async def list_batches():
-    """List all non-draft batches, newest first."""
-    result = get_supabase().table("batches") \
-        .select("*") \
-        .neq("status", "draft") \
-        .neq("status", "ready") \
-        .order("created_at", desc=True) \
-        .execute()
-    return BatchListResponse(batches=result.data or [])
-
-
-@app.get("/api/batches/{batch_id}/download-url", response_model=SignedUrlResponse)
-async def get_batch_download_url(batch_id: str):
-    """Signed URL for the original uploaded file."""
-    batch = await get_batch(batch_id)
-    if not batch:
-        raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
-
-    path = batch.get("input_file_path")
-    if not path:
-        raise HTTPException(status_code=404, detail="No file associated with this batch")
-
-    try:
-        signed = get_supabase().storage.from_("batch-files").create_signed_url(path, 3600)
-        url = (
-            signed.get("signedURL")
-            or signed.get("signedUrl")
-            or (getattr(signed, "signed_url", None))
-        )
-        if not url:
-            raise HTTPException(
-                status_code=500, detail=f"Storage returned no URL for path: {path}"
-            )
-        return SignedUrlResponse(url=str(url))
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to create signed URL for batch file {path}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to generate download URL")
-
-
-@app.delete("/api/batches/{batch_id}/draft", response_model=DraftDeleteResponse)
-async def delete_draft_batch(batch_id: str):
-    """Delete a draft batch. Atomic — only deletes if status is still 'draft'."""
-    result = get_supabase().table("batches") \
-        .delete() \
-        .eq("id", batch_id) \
-        .eq("status", "draft") \
-        .execute()
-    if not result.data:
-        return DraftDeleteResponse(status="not_found_or_not_draft")
-    return DraftDeleteResponse(status="deleted", batch_id=batch_id)
-
-
-@app.get("/api/batches/{batch_id}", response_model=BatchDetailResponse)
-async def get_batch_detail(batch_id: str):
-    """Full batch record with all associated calls."""
-    batch = await get_batch(batch_id)
-    if not batch:
-        raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
-
-    calls = get_supabase().table("calls") \
-        .select("*") \
-        .eq("batch_id", batch_id) \
-        .order("batch_row_index", desc=False) \
-        .execute()
-
-    return BatchDetailResponse(batch=batch, calls=calls.data or [])
-
-
-@app.get("/api/batches/{batch_id}/status")
-async def batch_status(batch_id: str):
-    batch = await get_batch(batch_id)
-    if not batch:
-        return JSONResponse(status_code=404, content={"detail": "batch not found"})
-    return {
-        "batch_id": batch_id,
-        "status": batch.get("status"),
-        "agent_name": batch.get("agent_name"),
-        "agent_display_name": batch.get("agent_display_name"),
-        "total": batch.get("total_rows", 0),
-        "completed": batch.get("completed_rows", 0),
-        "failed": batch.get("failed_rows", 0),
-    }
-
-
-@app.get("/api/batches/{batch_id}/results")
-async def batch_results(batch_id: str):
-    batch = await get_batch(batch_id)
-    if not batch:
-        return JSONResponse(status_code=404, content={"detail": "batch not found"})
-    out_path = batch.get("output_file_path")
-    if not out_path:
-        return JSONResponse(
-            status_code=404,
-            content={"detail": "results not ready yet"},
-        )
-    try:
-        data = await asyncio.to_thread(_storage_download, out_path)
-    except Exception as e:
-        logger.exception("Download batch results failed")
-        return JSONResponse(status_code=500, content={"detail": str(e)})
-    return Response(
-        content=data,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": f'attachment; filename="batch_{batch_id}_results.xlsx"',
-        },
-    )
-
-
-# ── Twilio inbound + WebSocket ──────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# CALLING ENGINE: Twilio inbound + WebSocket
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 _SKIP_TWILIO_VALIDATION = os.getenv("SKIP_TWILIO_VALIDATION", "false").lower() == "true"
 
 
+# Twilio → our terminal status mapping.
+# Non-terminal states (queued, initiated, ringing, in-progress) are ignored —
+# the pipeline's own write wins when the call connects and completes normally.
+_TWILIO_TERMINAL_MAP = {
+    "completed": "completed",
+    "busy": "busy",
+    "no-answer": "no_answer",
+    "canceled": "failed",
+    "failed": "failed",
+}
+
+
+async def _validate_twilio_signature(request: Request, form_data: Any) -> bool:
+    """Return True if the Twilio signature is valid (or validation is skipped)."""
+    if _SKIP_TWILIO_VALIDATION:
+        return True
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    if not auth_token:
+        return False
+    signature = request.headers.get("X-Twilio-Signature", "")
+    url = str(request.url)
+    params = {k: str(v) for k, v in form_data.items()}
+    return RequestValidator(auth_token).validate(url, params, signature)
+
+
+@app.post("/api/twilio/status-callback")
+async def twilio_status_callback(request: Request):
+    """Receive Twilio call status updates.
+
+    On terminal status (busy, no-answer, canceled, failed, completed), write
+    the corresponding status to the batch row or call request so the consumer
+    can release its concurrency slot within seconds. For `completed`, only
+    write if the pipeline hasn't already (pipeline's value wins).
+    """
+    form_data = await request.form()
+
+    if not await _validate_twilio_signature(request, form_data):
+        logger.warning(
+            "Invalid Twilio signature on status callback "
+            f"from {request.client.host if request.client else 'unknown'}"
+        )
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    params = {k: str(v) for k, v in form_data.items()}
+    call_sid = params.get("CallSid", "")
+    call_status = params.get("CallStatus", "")
+
+    if not call_sid or not call_status:
+        return {"status": "ignored"}
+
+    our_status = _TWILIO_TERMINAL_MAP.get(call_status)
+    if not our_status:
+        # Non-terminal: queued / initiated / ringing / in-progress. Nothing to do.
+        logger.debug(f"Twilio status callback {call_sid}: {call_status} (non-terminal)")
+        return {"status": "noted", "twilio_status": call_status}
+
+    from server.twilio_outbound import get_pending_call_by_sid
+
+    found = get_pending_call_by_sid(_pending_calls, call_sid)
+    if not found:
+        logger.info(f"Twilio status callback for unknown sid {call_sid} ({call_status})")
+        return {"status": "unknown_call", "twilio_status": call_status}
+
+    _our_call_id, entry = found
+    batch_row_id = entry.get("batch_row_id")
+    request_id = entry.get("request_id")
+
+    err_msg = None if our_status == "completed" else f"Twilio: {call_status}"
+
+    try:
+        if batch_row_id:
+            # Don't overwrite if pipeline already set it to completed with full data.
+            try:
+                existing = await invoke("GET", f"/batch-rows/{batch_row_id}")
+            except Exception:
+                existing = None
+            existing_status = existing.get("status") if isinstance(existing, dict) else None
+            if existing_status == "completed":
+                logger.debug(
+                    f"Status callback: batch_row {batch_row_id} already completed, skipping"
+                )
+            else:
+                body = {"status": our_status}
+                if err_msg:
+                    body["error_message"] = err_msg
+                await invoke("PUT", f"/batch-rows/{batch_row_id}", body=body)
+                logger.info(
+                    f"Status callback: batch_row {batch_row_id} → {our_status} "
+                    f"(twilio={call_status})"
+                )
+
+        if request_id:
+            try:
+                existing = await invoke("GET", f"/call-requests/{request_id}")
+            except Exception:
+                existing = None
+            existing_status = existing.get("status") if isinstance(existing, dict) else None
+            if existing_status == "completed":
+                logger.debug(
+                    f"Status callback: call_request {request_id} already completed, skipping"
+                )
+            else:
+                body = {"status": our_status}
+                if err_msg:
+                    body["error_message"] = err_msg
+                await invoke("PUT", f"/call-requests/{request_id}", body=body)
+                logger.info(
+                    f"Status callback: call_request {request_id} → {our_status} "
+                    f"(twilio={call_status})"
+                )
+    except Exception:
+        logger.exception("Twilio status callback write failed")
+
+    return {"status": "updated", "our_status": our_status, "twilio_status": call_status}
+
+
 @app.post("/twilio/incoming")
 async def twilio_incoming(request: Request):
-    """Return TwiML for inbound calls — routes via phone_numbers table."""
+    """Return TwiML for inbound calls — routes via phone_numbers from Lambda."""
     if not _SKIP_TWILIO_VALIDATION:
         auth_token = os.getenv("TWILIO_AUTH_TOKEN")
         if not auth_token:
@@ -1467,7 +1096,7 @@ async def twilio_incoming(request: Request):
         validator = RequestValidator(auth_token)
         if not validator.validate(url, params, signature):
             logger.warning(
-                f"Invalid Twilio signature on incoming webhook "
+                "Invalid Twilio signature on incoming webhook "
                 f"from {request.client.host if request.client else 'unknown'}"
             )
             raise HTTPException(status_code=403, detail="Invalid Twilio signature")
@@ -1479,31 +1108,19 @@ async def twilio_incoming(request: Request):
 
     agent_name = None
     if to_number:
-        resp = (
-            get_supabase()
-            .table("phone_numbers")
-            .select("inbound_agent_id")
-            .eq("number", to_number)
-            .eq("is_active", True)
-            .limit(1)
-            .execute()
-        )
-        if resp.data and resp.data[0].get("inbound_agent_id"):
-            agent_id = resp.data[0]["inbound_agent_id"]
-            agent_resp = (
-                get_supabase()
-                .table("agents")
-                .select("name")
-                .eq("id", agent_id)
-                .eq("is_active", True)
-                .limit(1)
-                .execute()
-            )
-            if agent_resp.data:
-                agent_name = agent_resp.data[0]["name"]
+        try:
+            phones = await list_phone_numbers()
+            for p in phones:
+                if p.get("number") == to_number:
+                    inbound = p.get("inbound_agent")
+                    if isinstance(inbound, dict) and inbound.get("name"):
+                        agent_name = inbound["name"]
+                    break
+        except Exception:
+            logger.exception("Failed to look up inbound agent from Lambda")
 
     if not agent_name:
-        agent_name = os.getenv("DEFAULT_INBOUND_AGENT", "chris/claim_status")
+        agent_name = os.getenv("DEFAULT_INBOUND_AGENT", "chris")
 
     ws_url = ws_url_from_env()
     response = VoiceResponse()
@@ -1534,15 +1151,9 @@ async def websocket_endpoint(websocket: WebSocket):
             pass
 
 
-# ── WebRTC test calls ───────────────────────────────────────────────────────
-#
-# The SmallWebRTCTransport client SDK sends ALL requests (connect, SDP offer,
-# ICE candidates) to the same endpoint URL.  We detect the request type by
-# checking the HTTP method and the presence of an ``sdp`` key in the body.
-#
-#   POST  (no sdp)  → RTVI connect: validate agent, return sessionId
-#   POST  (has sdp) → WebRTC SDP offer/answer exchange
-#   PATCH           → ICE trickle candidates
+# ═════════════════════════════════════════════════════════════════════════════
+# CALLING ENGINE: WebRTC test calls
+# ═════════════════════════════════════════════════════════════════════════════
 
 _test_call_sessions: dict[str, dict] = {}
 
@@ -1552,7 +1163,7 @@ async def test_call_connect(request: Request):
     body = await request.json()
     logger.info(f"[TEST CALL] {request.method} body_keys={list(body.keys())} qp={dict(request.query_params)}")
 
-    # ── PATCH → ICE trickle candidates ──────────────────────────────────
+    # ── PATCH → ICE trickle candidates
     if request.method == "PATCH":
         candidates = [
             IceCandidate(
@@ -1569,7 +1180,7 @@ async def test_call_connect(request: Request):
         await _webrtc_handler.handle_patch_request(patch_req)
         return {"status": "ok"}
 
-    # ── POST with SDP → WebRTC offer/answer exchange ────────────────────
+    # ── POST with SDP → WebRTC offer/answer exchange
     if body.get("sdp"):
         req_data = body.get("requestData") or body.get("request_data") or {}
         qp = request.query_params
@@ -1589,7 +1200,6 @@ async def test_call_connect(request: Request):
 
         case_data = req_data.get("case_data") or body.get("case_data") or {}
         if isinstance(case_data, str):
-            import json as _json
             try:
                 case_data = _json.loads(case_data)
             except ValueError:
@@ -1628,7 +1238,7 @@ async def test_call_connect(request: Request):
         )
         return answer
 
-    # ── POST without SDP → RTVI connect ─────────────────────────────────
+    # ── POST without SDP → RTVI connect
     config = body.get("body", body)
     qp = request.query_params
     agent_name = config.get("agent_name") or qp.get("agent_name")
@@ -1641,14 +1251,12 @@ async def test_call_connect(request: Request):
 
     case_data = config.get("case_data") or {}
     if isinstance(case_data, str):
-        import json as _json
         try:
             case_data = _json.loads(case_data)
         except ValueError:
             case_data = {}
     qp_case = qp.get("case_data")
     if qp_case and not case_data:
-        import json as _json
         try:
             case_data = _json.loads(qp_case)
         except ValueError:
@@ -1657,11 +1265,12 @@ async def test_call_connect(request: Request):
     if not agent_name:
         raise HTTPException(status_code=400, detail="agent_name is required")
 
-    table = "agent_drafts" if use_draft else "agents"
-    query = get_supabase().table(table).select("name").eq("name", agent_name).limit(1)
-    if not use_draft:
-        query = query.eq("is_active", True)
-    if not query.execute().data:
+    if use_draft:
+        check = await get_agent_draft(agent_name)
+    else:
+        check = await get_agent_config(agent_name)
+
+    if not check:
         raise HTTPException(
             status_code=404,
             detail=f"{'Draft' if use_draft else 'Agent'} not found: {agent_name}",

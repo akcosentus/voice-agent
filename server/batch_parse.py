@@ -1,28 +1,23 @@
-"""Parse batch upload files (CSV / Excel) and validate phone numbers."""
+"""Parse batch upload files and validate phone numbers."""
 
 from __future__ import annotations
 
+import csv
+import datetime
 import io
 import re
 from typing import Any
 
-import pandas as pd
+import openpyxl
 
 
-def normalize_phone(raw: str) -> str | None:
-    """Normalize a phone string to E.164 format.
-
-    Returns the E.164 string (e.g. "+18772268749") or None if invalid.
-    """
-    digits = re.sub(r"\D", "", raw or "")
-    if len(digits) == 10:
-        return f"+1{digits}"
-    if len(digits) == 11 and digits.startswith("1"):
-        return f"+{digits}"
-    if len(digits) >= 11:
-        return f"+{digits}"
-    return None
-
+def _sanitize_cell(val: Any) -> Any:
+    """Convert non-JSON-serializable cell values (datetime, date, etc.) to strings."""
+    if isinstance(val, datetime.datetime):
+        return val.strftime("%m/%d/%Y")
+    if isinstance(val, datetime.date):
+        return val.strftime("%m/%d/%Y")
+    return val
 
 _PHONE_HEADER_ALIASES = frozenset(
     {
@@ -44,11 +39,11 @@ _PHONE_HEADER_ALIASES = frozenset(
 def _normalize_header(h: Any) -> str:
     if h is None:
         return ""
-    return str(h).strip().lstrip("\ufeff")
+    return str(h).strip()
 
 
 def detect_phone_column(headers: list[str]) -> int | None:
-    lowered = [h.lower() for h in headers]
+    lowered = [_normalize_header(h).lower() for h in headers]
     for i, h in enumerate(lowered):
         for alias in _PHONE_HEADER_ALIASES:
             if h == alias or alias in h:
@@ -80,6 +75,8 @@ def classify_phone(raw: Any) -> tuple[str, str]:
         return "valid", "+" + d
     if len(d) == 11 and not d.startswith("1"):
         return "fixable", ""
+    if len(d) == 10 and s.startswith("+"):
+        return "valid", "+1" + d
     if 7 <= len(d) <= 15:
         return "fixable", ""
     return "invalid", ""
@@ -88,40 +85,49 @@ def classify_phone(raw: Any) -> tuple[str, str]:
 def parse_upload_file(
     content: bytes, filename: str
 ) -> tuple[list[str], list[dict[str, Any]]]:
-    """Return (headers, rows_as_dicts).
-
-    Uses Pandas for robust handling of BOM, encoding, quoted CSV fields,
-    and Excel formats.  Everything is read as strings to avoid type coercion.
-    """
+    """Return (headers, rows_as_dicts)."""
     name = filename.lower()
-
     if name.endswith(".csv"):
-        df = pd.read_csv(
-            io.BytesIO(content),
-            encoding="utf-8-sig",
-            dtype=str,
-            keep_default_na=False,
-        )
-    elif name.endswith((".xlsx", ".xls", ".xlsm")):
-        df = pd.read_excel(
-            io.BytesIO(content),
-            dtype=str,
-            keep_default_na=False,
-            sheet_name=0,
-            engine="openpyxl",
-        )
-    else:
-        raise ValueError("Unsupported file type; use .xlsx, .xlsm, or .csv")
+        text = content.decode("utf-8-sig", errors="replace")
+        reader = csv.reader(io.StringIO(text))
+        rows_list = list(reader)
+        if not rows_list:
+            return [], []
+        headers = [_normalize_header(h) for h in rows_list[0]]
+        out = []
+        for parts in rows_list[1:]:
+            row = {}
+            for i, h in enumerate(headers):
+                if not h:
+                    continue
+                row[h] = parts[i] if i < len(parts) else ""
+            out.append(row)
+        return headers, out
 
-    df.columns = [_normalize_header(c) for c in df.columns]
-    df = df.loc[:, df.columns != ""]
+    if name.endswith(".xlsx") or name.endswith(".xlsm"):
+        wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            rows_iter = ws.iter_rows(values_only=True)
+            header_row = next(rows_iter, None)
+            if not header_row:
+                return [], []
+            headers = [_normalize_header(h) for h in header_row]
+            out = []
+            for row in rows_iter:
+                if row is None or all(v is None or str(v).strip() == "" for v in row):
+                    continue
+                d: dict[str, Any] = {}
+                for i, h in enumerate(headers):
+                    if not h:
+                        continue
+                    d[h] = _sanitize_cell(row[i]) if i < len(row) else ""
+                out.append(d)
+            return headers, out
+        finally:
+            wb.close()
 
-    # Drop fully-empty rows
-    df = df.dropna(how="all").replace({float("nan"): ""})
-
-    headers = df.columns.tolist()
-    rows = df.to_dict(orient="records")
-    return headers, rows
+    raise ValueError("Unsupported file type; use .xlsx, .xlsm, or .csv")
 
 
 def build_row_payloads(
@@ -148,7 +154,6 @@ def build_row_payloads(
             {
                 "row_index": i,
                 "phone_e164": e164,
-                "phone_raw": str(raw_phone),
                 "validation": val,
                 "case_data": dict(row),
             }

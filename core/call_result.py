@@ -23,3 +23,4 @@ class CallResult:
     error: Optional[str] = None
     batch_id: Optional[str] = None
     batch_row_index: Optional[int] = None
+    batch_row_id: Optional[str] = None

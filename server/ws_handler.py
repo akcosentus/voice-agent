@@ -16,9 +16,8 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
 )
 
-from core.call_lifecycle import run_call, safe_save_call, supabase_configured
+from core.call_lifecycle import run_call, safe_save_call
 from core.call_result import CallResult
-from core.call_store import increment_batch_counter
 from core.config_loader import load_agent_config
 from core.pipeline import build_pipeline, build_pipeline_components
 
@@ -63,6 +62,7 @@ async def handle_twilio_websocket(
     ) or "inbound"
     batch_id = pending.get("batch_id") if pending else None
     batch_row_index = pending.get("batch_row_index") if pending else None
+    batch_row_id = pending.get("batch_row_id") if pending else None
     direction = "outbound" if pending else "inbound"
 
     call_key = pending_key or call_sid
@@ -91,10 +91,18 @@ async def handle_twilio_websocket(
         components,
         transport,
         config=config,
-        pipeline_params=PipelineParams(
-            audio_in_sample_rate=8000,
-            audio_out_sample_rate=8000,
-        ),
+        # Twilio audio path:
+        #   audio_out_sample_rate = 8000   → Fish (and any TTS) synthesizes
+        #     directly at 8kHz, exactly what Twilio's μ-law leg needs. No
+        #     resampling between TTS output and the wire. This eliminates
+        #     the chunk-pacing artifacts we saw in the 2026-04-17 17:48 call
+        #     when Fish synthesized at 24kHz and Pipecat resampled to 8kHz
+        #     before μ-law encoding for Twilio.
+        #   audio_in_sample_rate = (default 16000) — DO NOT set to 8000.
+        #     Smart Turn v3 model expects 16kHz input (Pipecat #3844).
+        #     TwilioFrameSerializer's _input_resampler upsamples Twilio's
+        #     8kHz μ-law to 16kHz on ingest automatically.
+        pipeline_params=PipelineParams(audio_out_sample_rate=8000),
         call_id=call_key,
     )
 
@@ -109,16 +117,8 @@ async def handle_twilio_websocket(
         case_data=case_data,
         batch_id=batch_id,
         batch_row_index=batch_row_index,
+        batch_row_id=batch_row_id,
     )
     await safe_save_call(result)
 
     await run_call(bundle, transport, config, result, case_data)
-
-    if result.batch_id and supabase_configured():
-        try:
-            if result.status == "completed":
-                await increment_batch_counter(result.batch_id, "completed_rows")
-            else:
-                await increment_batch_counter(result.batch_id, "failed_rows")
-        except Exception:
-            logger.exception("Failed to update batch counters")

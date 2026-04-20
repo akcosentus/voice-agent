@@ -73,29 +73,42 @@ async def run_post_call_analyses(
 
     client = anthropic.AsyncAnthropic()
 
-    try:
-        response = await client.messages.create(
-            model=pca.model,
-            max_tokens=1000,
-            messages=[{"role": "user", "content": prompt}],
-        )
+    _FALLBACK_MODEL = "claude-sonnet-4-6"
+    model = pca.model
+    for attempt_model in [model, _FALLBACK_MODEL]:
+        try:
+            response = await client.messages.create(
+                model=attempt_model,
+                max_tokens=1000,
+                messages=[{"role": "user", "content": prompt}],
+            )
 
-        result_text = response.content[0].text.strip()
-        result_text = result_text.replace("```json", "").replace("```", "").strip()
+            result_text = response.content[0].text.strip()
+            result_text = result_text.replace("```json", "").replace("```", "").strip()
 
-        results = json.loads(result_text)
+            results = json.loads(result_text)
 
-        for field in pca.fields:
-            if field.type == "selector" and field.name in results:
-                if results[field.name] not in field.choices:
-                    results[field.name] = f"invalid: {results[field.name]}"
+            for field in pca.fields:
+                if field.type == "selector" and field.name in results:
+                    if results[field.name] not in field.choices:
+                        results[field.name] = f"invalid: {results[field.name]}"
 
-        logger.info(f"[POST-CALL] Analysis complete: {list(results.keys())}")
-        return results
+            if attempt_model != model:
+                logger.warning(f"[POST-CALL] Used fallback model {attempt_model} (primary {model} unavailable)")
+            logger.info(f"[POST-CALL] Analysis complete: {list(results.keys())}")
+            return results
 
-    except json.JSONDecodeError as e:
-        logger.error(f"[POST-CALL] Failed to parse JSON response: {e}")
-        return {"_error": "Failed to parse analysis response"}
-    except Exception as e:
-        logger.error(f"[POST-CALL] Analysis failed: {e}")
-        return {"_error": str(e)}
+        except anthropic.NotFoundError:
+            if attempt_model != _FALLBACK_MODEL:
+                logger.warning(f"[POST-CALL] Model {attempt_model} not found, trying {_FALLBACK_MODEL}")
+                continue
+            logger.error(f"[POST-CALL] Fallback model {_FALLBACK_MODEL} also not found")
+            return {"_error": f"No available model (tried {model}, {_FALLBACK_MODEL})"}
+        except json.JSONDecodeError as e:
+            logger.error(f"[POST-CALL] Failed to parse JSON response: {e}")
+            return {"_error": "Failed to parse analysis response"}
+        except Exception as e:
+            logger.error(f"[POST-CALL] Analysis failed: {e}")
+            return {"_error": str(e)}
+
+    return {"_error": "Post-call analysis exhausted all model options"}
