@@ -16,6 +16,12 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+# Must import core.logging BEFORE anything that emits logs does its
+# first emit. This installs a loguru filter that drops Pipecat vendor
+# DEBUG records known to dump PHI (hydrated prompts, messages). See
+# core/logging.py for the fingerprint list and re-audit command.
+import core.logging  # noqa: E402, F401  — installs filtered loguru sink at import time
+
 from fastapi import (
     FastAPI,
     File,
@@ -1211,7 +1217,10 @@ async def test_call_connect(request: Request):
             use_draft = last["use_draft"]
             case_data = case_data or last.get("case_data", {})
 
-        logger.info(f"[TEST CALL SDP] agent={agent_name} case_data={case_data}")
+        logger.info(
+            f"[TEST CALL SDP] agent={agent_name} "
+            f"case_keys={sorted(case_data.keys())}"
+        )
 
         if not agent_name:
             raise HTTPException(
@@ -1282,7 +1291,10 @@ async def test_call_connect(request: Request):
         "use_draft": use_draft,
         "case_data": case_data,
     }
-    logger.info(f"[TEST CALL CONNECT] session={session_id} agent={agent_name} case_data={case_data}")
+    logger.info(
+        f"[TEST CALL CONNECT] session={session_id} agent={agent_name} "
+        f"case_keys={sorted(case_data.keys())}"
+    )
 
     return {
         "sessionId": session_id,

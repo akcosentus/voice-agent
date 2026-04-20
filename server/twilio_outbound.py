@@ -7,6 +7,8 @@ from loguru import logger
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import Connect, Stream, VoiceResponse
 
+from core.redaction import mask_phone
+
 
 def _server_url() -> str:
     return os.getenv("SERVER_URL", "").rstrip("/")
@@ -102,5 +104,8 @@ def place_outbound_call(
     # our internal call_id + downstream batch_row_id / request_id.
     pending_calls[cid]["twilio_sid"] = call.sid
 
-    logger.info(f"Twilio outbound call_id={cid} sid={call.sid} to={target_number}")
+    logger.info(
+        f"Twilio outbound call_id={cid} sid={call.sid} "
+        f"to={mask_phone(target_number)}"
+    )
     return cid, call.sid

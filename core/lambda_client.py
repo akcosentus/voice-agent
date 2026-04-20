@@ -19,6 +19,8 @@ from typing import Any, Optional
 
 import httpx
 
+from core.redaction import mask_phone
+
 logger = logging.getLogger(__name__)
 
 LAMBDA_FUNCTION = os.getenv("LAMBDA_FUNCTION_NAME", "medcloud-voice-api")
@@ -216,7 +218,10 @@ async def save_call_record(call_data: dict) -> Optional[str]:
     """Save a completed call record. Returns the call ID or None on failure."""
     result = await invoke("POST", "/calls", body=call_data)
     if not result or _is_error(result):
-        logger.error("Failed to save call record for %s", call_data.get("target_number"))
+        logger.error(
+            "Failed to save call record for %s",
+            mask_phone(call_data.get("target_number")),
+        )
         return None
     return result.get("id") if isinstance(result, dict) else None
 

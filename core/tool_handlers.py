@@ -26,6 +26,8 @@ import os
 
 from loguru import logger
 from pipecat.audio.dtmf.types import KeypadEntry
+
+from core.redaction import mask_phone
 from pipecat.frames.frames import (
     EndFrame,
     InterruptionTaskFrame,
@@ -63,7 +65,10 @@ async def transfer_call(params: FunctionCallParams, task: PipelineTask, settings
 
     call_sid = getattr(task, "_call_sid", None)
     if not call_sid:
-        logger.info(f"Transfer simulated (no Twilio SID): {target_name} → {phone_number}")
+        logger.info(
+            f"Transfer simulated (no Twilio SID): "
+            f"{target_name} → {mask_phone(phone_number)}"
+        )
         await params.result_callback({
             "status": "simulated",
             "message": f"In a live call, this would transfer to {target_name} ({phone_number})",
@@ -80,7 +85,10 @@ async def transfer_call(params: FunctionCallParams, task: PipelineTask, settings
         client.calls(call_sid).update(
             twiml=f'<Response><Dial>{phone_number}</Dial></Response>'
         )
-        logger.info(f"Transferred call {call_sid} to {target_name} ({phone_number})")
+        logger.info(
+            f"Transferred call {call_sid} to {target_name} "
+            f"({mask_phone(phone_number)})"
+        )
         await params.result_callback({"status": "transferred", "target": target_name})
     except Exception as e:
         logger.exception(f"Transfer to {target_name} failed")

@@ -27,6 +27,7 @@ from openpyxl import Workbook
 from core.call_store import parse_jsonb
 from core.config_loader import load_agent_config
 from core.lambda_client import invoke as lambda_invoke
+from core.redaction import mask_phone
 
 SQS_QUEUE_URL = os.getenv(
     "CALL_QUEUE_URL",
@@ -291,13 +292,15 @@ class UnifiedCallConsumer:
             await self._mark_dialing(body)
             call_id = await self._dial(body)
             logger.info(
-                f"Consumer dialed {body.get('to_number')} call_id={call_id} source={source}"
+                f"Consumer dialed {mask_phone(body.get('to_number'))} "
+                f"call_id={call_id} source={source}"
             )
 
             # Wait for the pipeline to write the terminal status
             terminal_status = await self._wait_for_terminal(body)
             logger.info(
-                f"Consumer: {body.get('to_number')} reached terminal status={terminal_status}"
+                f"Consumer: {mask_phone(body.get('to_number'))} "
+                f"reached terminal status={terminal_status}"
             )
 
             # Call was handed off successfully — regardless of terminal outcome,
@@ -316,7 +319,7 @@ class UnifiedCallConsumer:
                 reason = "permanent failure" if permanent else "max attempts reached"
                 logger.error(
                     f"Consumer: dial failed (final, {reason}) "
-                    f"{body.get('to_number')}: {error_msg}"
+                    f"{mask_phone(body.get('to_number'))}: {error_msg}"
                 )
                 await self._mark_failed(body, f"{reason}: {error_msg}")
                 await self._delete(receipt)
@@ -325,7 +328,7 @@ class UnifiedCallConsumer:
             else:
                 logger.warning(
                     f"Consumer: dial failed (attempt {attempt}/{max_attempts}) "
-                    f"{body.get('to_number')}: {error_msg}"
+                    f"{mask_phone(body.get('to_number'))}: {error_msg}"
                 )
                 await self._mark_retry(body, attempt, error_msg)
                 # Shorten visibility timeout so SQS redelivers in ~60s
