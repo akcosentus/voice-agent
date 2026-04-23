@@ -1,5 +1,7 @@
--- Run in Supabase SQL Editor (after creating project).
--- Calls log: one row per Twilio call / voice session.
+-- Historical schema snapshot (applied once during initial DB setup).
+-- The live DB is Aurora PostgreSQL, managed by medcloud-voice-api Lambda;
+-- this file is kept as a reference for the original `calls` table shape.
+-- One row per Twilio call / voice session.
 
 create table if not exists calls (
     id text primary key,

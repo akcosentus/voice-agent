@@ -93,5 +93,5 @@ async def main(agent_name: str, cases_file: str, case_index: int):
 - Original file: `run.py` (deleted 2026-04-20 in cleanup commit, part of the
   pre-LiveKit-migration housekeeping sprint).
 - Last Pipecat version `run.py` was verified against: 0.0.108.
-- Agents at the time: `chris/claim_status` (Supabase-era naming, now
-  `chris-claim-status` in Aurora).
+- Agents at the time: `chris/claim_status` (pre-migration slash-delimited
+  naming, now `chris-claim-status` in the current Aurora schema).
